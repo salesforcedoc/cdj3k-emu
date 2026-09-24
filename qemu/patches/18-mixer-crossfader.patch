@@ -1,0 +1,104 @@
+diff --git a/audio/coreaudio.m b/audio/coreaudio.m
+--- a/audio/coreaudio.m
++++ b/audio/coreaudio.m
+@@ -46,7 +46,7 @@
+ };
+ 
+ #define CDJ3K_MIXER_MAGIC 0x31584d43u /* "CMX1" little-endian */
+-#define CDJ3K_MIXER_VERSION 1u
++#define CDJ3K_MIXER_VERSION 2u
+ #define CDJ3K_MIXER_CHANNELS 4u
+ #define CDJ3K_MIXER_HEADER_BYTES 64u
+ #define CDJ3K_MIXER_CHANNEL_BYTES 64u
+@@ -73,7 +73,9 @@
+     bool enabled;
+     void *mixer_map;
+     size_t mixer_map_size;
++    _Atomic uint32_t *mixer_crossfader;
+     Cdj3kMixerChannel *mixer_channel;
++    int mixer_channel_index;
+     float mixer_low_state[2];
+     float mixer_high_state[2];
+     float mixer_filter_state[2];
+@@ -82,6 +84,7 @@
+     float mixer_mid_gain;
+     float mixer_low_gain;
+     float mixer_fader_gain;
++    float mixer_crossfader_gain;
+     float mixer_filter_alpha;
+     int mixer_filter_mode;
+     uint32_t mixer_control_cache[6];
+@@ -627,6 +630,14 @@
+     }
+     cdj3k_mixer_update_coefficients(core, channel, sample_rate);
+ 
++    float crossfader = cdj3k_mixer_norm(atomic_load_explicit(
++        core->mixer_crossfader, memory_order_relaxed));
++    /* DJ-style center: both sides are unity at the midpoint. Channels 1-2
++     * are fixed to A and channels 3-4 to B until assign switches are added. */
++    float target_crossfader = core->mixer_channel_index < 2
++        ? MIN(1.0f, (1.0f - crossfader) * 2.0f)
++        : MIN(1.0f, crossfader * 2.0f);
++
+     float inv_frames = 1.0f / frames;
+     float trim_step = (core->mixer_target_trim - core->mixer_trim_gain)
+                       * inv_frames;
+@@ -638,6 +649,8 @@
+                      * inv_frames;
+     float fader_step = (core->mixer_target_fader - core->mixer_fader_gain)
+                        * inv_frames;
++    float crossfader_step = (target_crossfader
++                             - core->mixer_crossfader_gain) * inv_frames;
+     float filter_step = (core->mixer_target_filter_alpha
+                          - core->mixer_filter_alpha) * inv_frames;
+ 
+@@ -648,6 +661,7 @@
+         core->mixer_mid_gain += mid_step;
+         core->mixer_low_gain += low_step;
+         core->mixer_fader_gain += fader_step;
++        core->mixer_crossfader_gain += crossfader_step;
+         core->mixer_filter_alpha += filter_step;
+ 
+         for (unsigned stream = 0; stream < channels; stream++) {
+@@ -676,7 +690,7 @@
+                     ? core->mixer_filter_state[state]
+                     : output - core->mixer_filter_state[state];
+             }
+-            output *= core->mixer_fader_gain;
++            output *= core->mixer_fader_gain * core->mixer_crossfader_gain;
+             output = MAX(-1.0f, MIN(1.0f, output));
+             samples[index] = output;
+             peak[state] = MAX(peak[state], fabsf(output));
+@@ -688,6 +702,7 @@
+     core->mixer_mid_gain = core->mixer_target_mid;
+     core->mixer_low_gain = core->mixer_target_low;
+     core->mixer_fader_gain = core->mixer_target_fader;
++    core->mixer_crossfader_gain = target_crossfader;
+     core->mixer_filter_alpha = core->mixer_target_filter_alpha;
+     if (channels == 1) {
+         peak[1] = peak[0];
+@@ -712,6 +727,7 @@
+     core->mixer_mid_gain = 1.0f;
+     core->mixer_low_gain = 1.0f;
+     core->mixer_fader_gain = 1.0f;
++    core->mixer_crossfader_gain = 1.0f;
+     core->mixer_filter_alpha = 1.0f;
+     core->mixer_coefficients_valid = false;
+     if (!path || !path[0] || channel_index < 0
+@@ -746,6 +762,8 @@
+     }
+     core->mixer_map = mapping;
+     core->mixer_map_size = CDJ3K_MIXER_BYTES;
++    core->mixer_crossfader = &header[2];
++    core->mixer_channel_index = channel_index;
+     core->mixer_channel = (Cdj3kMixerChannel *)
+         ((uint8_t *)mapping + CDJ3K_MIXER_HEADER_BYTES
+          + channel_index * CDJ3K_MIXER_CHANNEL_BYTES);
+@@ -754,6 +772,7 @@
+ static void cdj3k_mixer_fini(CoreaudioVoiceOut *core)
+ {
+     cdj3k_mixer_publish_silence(core);
++    core->mixer_crossfader = NULL;
+     core->mixer_channel = NULL;
+     if (core->mixer_map) {
+         munmap(core->mixer_map, core->mixer_map_size);

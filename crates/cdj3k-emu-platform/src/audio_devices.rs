@@ -1,4 +1,4 @@
-//! Enumerate CoreAudio output devices for the per-instance "Audio Output"
+//! Enumerate CoreAudio output devices for the application-wide "Audio Output"
 //! picker. UID is the stable identifier across reboots / USB replug; the
 //! display name is shown to the user but never persisted.
 //!
@@ -48,6 +48,9 @@ const K_AUDIO_DEVICE_PROPERTY_DEVICE_UID: u32 = fourcc(b"uid ");
 const K_AUDIO_OBJECT_PROPERTY_NAME: u32 = fourcc(b"lnam");
 const K_AUDIO_DEVICE_PROPERTY_STREAM_CONFIGURATION: u32 = fourcc(b"slay");
 const K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE: u32 = fourcc(b"nsrt");
+const K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE: u32 = fourcc(b"fsiz");
+const K_AUDIO_DEVICE_PROPERTY_SAFETY_OFFSET: u32 = fourcc(b"saft");
+const K_AUDIO_DEVICE_PROPERTY_LATENCY: u32 = fourcc(b"ltnc");
 
 const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: u32 = fourcc(b"glob");
 const K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT: u32 = fourcc(b"outp");
@@ -95,7 +98,7 @@ extern "C" {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioOutDevice {
     /// Stable identifier (e.g. `"AppleHDAEngineOutput:1B,0,1,1:0"` or
-    /// `"BuiltInSpeakerDevice"`). Persisted in InstanceSettings.
+    /// `"BuiltInSpeakerDevice"`). Persisted in application-wide settings.
     pub uid: String,
     /// Human label as shown in macOS Sound Preferences.
     pub name: String,
@@ -138,6 +141,43 @@ pub fn enumerate_output_devices() -> Vec<AudioOutDevice> {
 
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out
+}
+
+pub(crate) fn resolve_output_device(uid: Option<&str>) -> Option<(u32, u32)> {
+    let id = match uid.filter(|value| !value.is_empty()) {
+        Some(wanted) => list_device_ids()?.into_iter().find(|id| {
+            read_cf_string(*id, K_AUDIO_DEVICE_PROPERTY_DEVICE_UID)
+                .is_some_and(|candidate| candidate == wanted)
+        })?,
+        None => default_output_device_id()?,
+    };
+    Some((id, read_nominal_sample_rate(id).unwrap_or(48_000)))
+}
+
+/// Native HAL latency components for the selected output. These values are
+/// measured by the process that actually owns the CoreAudio device; QEMU has
+/// no host-audio timing role.
+pub(crate) fn output_latency_frames(id: u32) -> (u32, u32, u32) {
+    (
+        read_u32_property(
+            id,
+            K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE,
+            K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+        )
+        .unwrap_or(0),
+        read_u32_property(
+            id,
+            K_AUDIO_DEVICE_PROPERTY_SAFETY_OFFSET,
+            K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+        )
+        .unwrap_or(0),
+        read_u32_property(
+            id,
+            K_AUDIO_DEVICE_PROPERTY_LATENCY,
+            K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+        )
+        .unwrap_or(0),
+    )
 }
 
 // ── Internals ────────────────────────────────────────────────────────────────
@@ -270,6 +310,27 @@ fn read_nominal_sample_rate(id: AudioObjectID) -> Option<u32> {
         return None;
     }
     Some(rate.round() as u32)
+}
+
+fn read_u32_property(id: AudioObjectID, selector: u32, scope: u32) -> Option<u32> {
+    let addr = AudioObjectPropertyAddress {
+        selector,
+        scope,
+        element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+    let mut value = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            id,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            (&mut value as *mut u32).cast(),
+        )
+    };
+    (status == 0).then_some(value)
 }
 
 fn read_cf_string(id: AudioObjectID, selector: u32) -> Option<String> {

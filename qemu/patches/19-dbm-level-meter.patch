@@ -1,0 +1,48 @@
+diff --git a/audio/coreaudio.m b/audio/coreaudio.m
+--- a/audio/coreaudio.m
++++ b/audio/coreaudio.m
+@@ -607,6 +607,19 @@
+                           memory_order_relaxed);
+     atomic_store_explicit(&core->mixer_channel->peak[1], 0,
+                           memory_order_relaxed);
++}
++
++/* Encode a true peak into the UI's -60 dB .. +12 dB meter range. Keeping
++ * this pre-clipping lets the red +12 dB segment report overloads that the
++ * output safety clamp would otherwise hide. */
++static uint32_t cdj3k_mixer_peak_raw(float linear)
++{
++    if (linear <= 0.001f) {
++        return 0;
++    }
++    float db = 20.0f * log10f(linear);
++    float normalized = (MAX(-60.0f, MIN(12.0f, db)) + 60.0f) / 72.0f;
++    return (uint32_t)(normalized * 1000.0f);
+ }
+ 
+ /* Apply the current channel strip directly to QEMU's float32 interleaved
+@@ -691,9 +704,10 @@
+                     : output - core->mixer_filter_state[state];
+             }
+             output *= core->mixer_fader_gain * core->mixer_crossfader_gain;
++            float meter_sample = output;
+             output = MAX(-1.0f, MIN(1.0f, output));
+             samples[index] = output;
+-            peak[state] = MAX(peak[state], fabsf(output));
++            peak[state] = MAX(peak[state], fabsf(meter_sample));
+         }
+     }
+ 
+@@ -708,10 +722,10 @@
+         peak[1] = peak[0];
+     }
+     atomic_store_explicit(&channel->peak[0],
+-                          (uint32_t)(MIN(peak[0], 1.0f) * 1000.0f),
++                          cdj3k_mixer_peak_raw(peak[0]),
+                           memory_order_relaxed);
+     atomic_store_explicit(&channel->peak[1],
+-                          (uint32_t)(MIN(peak[1], 1.0f) * 1000.0f),
++                          cdj3k_mixer_peak_raw(peak[1]),
+                           memory_order_relaxed);
+ }
+ 

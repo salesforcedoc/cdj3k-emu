@@ -67,7 +67,9 @@
 #define AUDIO_LATENCY_MS_MAX 200u
 
 /*
- * VSND_QEMU_FACTOR - number of ALSA periods accumulated into one QEMU TX buf.
+ * The QEMU factor is the number of ALSA periods accumulated into one QEMU TX
+ * buffer. QEMU supplies it through the cdj3k-emu config-space extension;
+ * vanilla/invalid values fall back to VSND_QEMU_FACTOR_DEFAULT.
  *
  * QEMU's CoreAudio backend returns each TX buf approximately one TX-buf-duration
  * after submission (the audio must be consumed by CoreAudio before the buf is
@@ -81,10 +83,9 @@
  * ~31/32 bufs, Phase-1 stalls vanish, writei never blocks, snd-over events
  * disappear and audio is clean.
  */
-#define VSND_QEMU_FACTOR    16
+#define VSND_QEMU_FACTOR_DEFAULT 16
 
-/* Pool of QEMU TX buffers.  Each holds VSND_QEMU_FACTOR ALSA periods
- * (= 10.67 ms of audio at FACTOR=16, period_size=32, rate=48 kHz).
+/* Pool of QEMU TX buffers. Each holds qemu_factor ALSA periods.
  *
  * With the host-side deferred-return mechanism (return_tx_buffer is held
  * back until CoreAudio's IOProc has actually consumed the bytes), the
@@ -98,7 +99,7 @@
  * ~85 ms but steady - JUCE reports it honestly via snd_pcm_status_get_delay
  * (since hw_ptr advances at deferred-return time) and the network sync to
  * the other CDJ tracks our true playback position.
- *
+ */
 /* With deferred TX-buffer return on the QEMU side, each submitted buf stays
  * in flight until CoreAudio actually consumes its frames (~50–100ms for
  * HAL + static device latency + bypass ring, depending on warmup). At
@@ -127,12 +128,14 @@ struct virtio_snd_config {
 	 * the next field would land at offset 12 instead of 16, and we'd read
 	 * QEMU's controls value (0) instead of pipeline_extra_frames. */
 	__le32 controls;
-	/* Extension carried by our QEMU overlay (config space size +4 bytes):
-	 * depth in frames of the host audio pipeline downstream of the virtio
-	 * queue (CoreAudio bypass ring + DAC). The standard upstream virtio
-	 * spec doesn't have this; populated only when running against our
-	 * patched QEMU. Reads as 0 against vanilla QEMU. */
+	/* Extensions carried by our QEMU overlay (config space size +8 bytes).
+	 * These fields are absent from the upstream virtio-sound specification. */
+	/* Depth in frames of the host audio pipeline downstream of the virtio
+	 * queue (CoreAudio bypass ring + DAC). */
 	__le32 pipeline_extra_frames;
+	/* Number of fixed 64-frame ALSA periods QEMU asks us to accumulate into
+	 * one virtio TX request. Added by the cdj3k-emu QEMU overlay. */
+	__le32 tx_batch_periods;
 } __packed;
 
 struct virtio_snd_pcm_hdr {
@@ -197,6 +200,7 @@ struct vsnd_pcm {
 	u32                 host_extra_frames;/* cached pipeline_extra_frames from QEMU config; refreshed in tasklet */
 	unsigned int        period_bytes;     /* bytes per ALSA period */
 	unsigned int        qemu_period_bytes;/* bytes per QEMU TX buffer = VSND_QEMU_FACTOR × period_bytes */
+	unsigned int        qemu_factor;      /* ALSA periods accumulated per TX buffer */
 	unsigned int        frame_bytes;
 
 	/* hrtimer drives hw_ptr and snd_pcm_period_elapsed */
@@ -529,7 +533,7 @@ static void vsnd_tasklet_fn(struct tasklet_struct *t)
 				vpcm->pool_stall_ticks++;
 				vpcm->dbg_pool_drop++;
 				vpcm->dbg_interval_drop++;
-				if (vpcm->pool_stall_ticks < VSND_QEMU_FACTOR * 2) {
+				if (vpcm->pool_stall_ticks < vpcm->qemu_factor * 2) {
 					break; /* Phase 1: short retry */
 				}
 				/* Phase 2 gate: only fire if no bufs are in flight,
@@ -544,8 +548,7 @@ static void vsnd_tasklet_fn(struct tasklet_struct *t)
 				 * with stall counter rising at ~1000/s.
 				 * Scan is O(VSND_TX_BUFS) but only runs on pool-empty
 				 * paths which are rare in normal operation. */
-#define VSND_PHASE1_HARDCAP  (VSND_QEMU_FACTOR * 32)  /* ~340 ms */
-				if (vpcm->pool_stall_ticks < VSND_PHASE1_HARDCAP) {
+				if (vpcm->pool_stall_ticks < vpcm->qemu_factor * 32) {
 					int j, in_flight = 0;
 					for (j = 0; j < VSND_TX_BUFS; j++)
 						if (vpcm->bufs[j].in_flight)
@@ -571,13 +574,12 @@ static void vsnd_tasklet_fn(struct tasklet_struct *t)
 				 * snd-over-delta cascades, which empirically lock the
 				 * EP122 HuiProcessor thread into a userspace tight loop
 				 * that the kernel can't escape. */
-#define VSND_XRUN_THRESHOLD  (VSND_QEMU_FACTOR * 4)  /* 64 periods ≈ 42 ms */
 				vpcm->dbg_phase2_drop++;
 				vpcm->dbg_interval_phase2++;
 				vpcm->hw_ptr = (vpcm->hw_ptr + vpcm->period_size) %
 				               vpcm->buffer_size;
 				vpcm->phase2_streak++;
-				if (vpcm->phase2_streak == VSND_XRUN_THRESHOLD &&
+				if (vpcm->phase2_streak == vpcm->qemu_factor * 4 &&
 				    !vpcm->xrun_pending) {
 					vpcm->xrun_pending = true;
 					vpcm->dbg_xrun_signals++;
@@ -618,7 +620,7 @@ static void vsnd_tasklet_fn(struct tasklet_struct *t)
 		memcpy(dst, src, vpcm->period_bytes);
 		vpcm->accum_count++;
 
-		if (vpcm->accum_count == VSND_QEMU_FACTOR) {
+		if (vpcm->accum_count == vpcm->qemu_factor) {
 			vsnd_tx_submit(vpcm, vpcm->accum_buf);
 			vpcm->accum_buf   = NULL;
 			vpcm->accum_count = 0;
@@ -725,9 +727,8 @@ static enum hrtimer_restart vsnd_hrtimer_fn(struct hrtimer *t)
 	 * window without drift.  Per-burst CPU cost: 256 memcpy + 16 TX submits,
 	 * roughly 1 ms of guest CPU - acceptable.
 	 */
-#define VSND_OVERRUN_CLAMP  (VSND_QEMU_FACTOR * VSND_TX_BUFS / 2)  /* 256 periods ≈ 170 ms */
-	if (overrun > VSND_OVERRUN_CLAMP)
-		overrun = VSND_OVERRUN_CLAMP;
+	if (overrun > vpcm->qemu_factor * VSND_TX_BUFS / 2)
+		overrun = vpcm->qemu_factor * VSND_TX_BUFS / 2;
 	atomic_add((int)overrun, &vpcm->pending_periods);
 	tasklet_schedule(&vpcm->tasklet);
 	return HRTIMER_RESTART;
@@ -855,7 +856,6 @@ static int vsnd_pcm_hw_params(struct snd_pcm_substream *sub,
 {
 	struct vsnd_dev *vsnd = sub->pcm->private_data;
 	struct vsnd_pcm *vpcm = vsnd->pcm_state;
-	struct snd_pcm_runtime *r = sub->runtime;
 	struct virtio_snd_pcm_set_params cmd = {};
 	unsigned int fmt, rate, bps;
 	u64 ns;
@@ -879,7 +879,11 @@ static int vsnd_pcm_hw_params(struct snd_pcm_substream *sub,
 	vpcm->buffer_size        = params_buffer_size(params);
 	vpcm->rate               = params_rate(params);
 
-	vpcm->qemu_period_bytes  = vpcm->period_bytes * VSND_QEMU_FACTOR;
+	virtio_cread(vsnd->vdev, struct virtio_snd_config,
+		     tx_batch_periods, &vpcm->qemu_factor);
+	if (vpcm->qemu_factor < 8 || vpcm->qemu_factor > 32)
+		vpcm->qemu_factor = VSND_QEMU_FACTOR_DEFAULT;
+	vpcm->qemu_period_bytes  = vpcm->period_bytes * vpcm->qemu_factor;
 
 	/* hrtimer period duration */
 	ns = (u64)vpcm->period_size * 1000000000ULL;
@@ -928,7 +932,6 @@ static int vsnd_pcm_hw_free(struct snd_pcm_substream *sub)
 {
 	struct vsnd_dev *vsnd = sub->pcm->private_data;
 	struct vsnd_pcm *vpcm = vsnd->pcm_state;
-	struct snd_pcm_runtime *r = sub->runtime;
 	struct virtio_snd_pcm_hdr rel = {
 		.code = cpu_to_le32(VIRTIO_SND_R_PCM_RELEASE),
 		.stream_id = 0,
@@ -1302,5 +1305,5 @@ MODULE_PARM_DESC(verbose_stats,
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("cdj3k-emu");
-MODULE_DESCRIPTION("Minimal virtio-sound PCM playback - hrtimer timing, 16× accumulation, in-flight Phase-2 gate");
-MODULE_VERSION("1.6");
+MODULE_DESCRIPTION("Minimal virtio-sound PCM playback - hrtimer timing, configurable accumulation, in-flight Phase-2 gate");
+MODULE_VERSION("1.7");

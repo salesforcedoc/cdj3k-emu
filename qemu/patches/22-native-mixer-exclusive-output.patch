@@ -1,0 +1,64 @@
+diff --git a/audio/coreaudio.m b/audio/coreaudio.m
+--- a/audio/coreaudio.m
++++ b/audio/coreaudio.m
+@@ -793,10 +793,12 @@ static void cdj3k_mixer_init(CoreaudioVoiceOut *core)
+         _Atomic uint32_t *, _Atomic uint32_t *);
+     uint8_t *ring = (uint8_t *)mapping + CDJ3K_MIXER_RING_BASE
+                     + channel_index * CDJ3K_MIXER_RING_BYTES;
+-    virtio_snd_external_ring_configure(
+-        ring, &core->mixer_channel->ring_head,
+-        &core->mixer_channel->ring_tail, &header[3],
+-        &core->mixer_channel->ring_active);
++    if (atomic_load_explicit(&header[3], memory_order_acquire) != 0) {
++        virtio_snd_external_ring_configure(
++            ring, &core->mixer_channel->ring_head,
++            &core->mixer_channel->ring_tail, &header[3],
++            &core->mixer_channel->ring_active);
++    }
+ }
+ 
+ static void cdj3k_mixer_fini(CoreaudioVoiceOut *core)
+@@ -1524,6 +1526,16 @@ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as)
+ 
+     core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+ 
++    /* The external ring needs an AudioState voice for virtio-snd negotiation,
++     * but it does not need (or want) a per-player HAL IOProc. The singleton
++     * native mixer owns the sole hardware output unit. */
++    extern int virtio_snd_external_ring_is_active(void);
++    if (virtio_snd_external_ring_is_active()) {
++        core->device_id = kAudioDeviceUnknown;
++        core->ioprocid = NULL;
++        return 0;
++    }
++
+     /* cdj3k-emu: capture the per-instance device UID (if the user picked one
+      * via the Audio → Output Device menu). Stored process-globally so the
+      * default-device-change listener path also honors it. Empty string means
+@@ -1570,15 +1582,18 @@ static void coreaudio_fini_out (HWVoiceOut *hw)
+     int err;
+     CoreaudioVoiceOut *core = (CoreaudioVoiceOut *)hw;
+ 
+-    status = AudioObjectRemovePropertyListener(kAudioObjectSystemObject,
+-                                               &voice_out_addr,
+-                                               handle_voice_out_change,
+-                                               core);
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_logerr(status, "Could not remove voice property change listener");
+-    }
++    extern int virtio_snd_external_ring_is_active(void);
++    if (!virtio_snd_external_ring_is_active()) {
++        status = AudioObjectRemovePropertyListener(kAudioObjectSystemObject,
++                                                   &voice_out_addr,
++                                                   handle_voice_out_change,
++                                                   core);
++        if (status != kAudioHardwareNoError) {
++            coreaudio_logerr(status, "Could not remove voice property change listener");
++        }
+ 
+-    fini_out_device(core);
++        fini_out_device(core);
++    }
+     cdj3k_mixer_fini(core);
+ 
+     /* destroy mutex */

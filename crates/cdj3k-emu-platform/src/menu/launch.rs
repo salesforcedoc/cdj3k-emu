@@ -51,6 +51,17 @@ pub(super) fn show_net_error_alert(message: &str) {
         .show();
 }
 
+/// Show a live-audio recovery failure. The emulator keeps running, so the
+/// selected output can be reconnected or changed before trying again.
+pub(super) fn show_audio_error_alert(message: &str) {
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("Audio reset failed")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
 pub(super) fn show_fda_alert() {
     let result = rfd::MessageDialog::new()
         .set_title("Admin access required")

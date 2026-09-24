@@ -75,31 +75,69 @@ if ! ls "${PATCHES_DIR}"/*.patch >/dev/null 2>&1; then
     exit 1
 fi
 
-# Check whether any patch is already applied to the current tree (idempotent
-# re-runs after a successful build land here).  We probe with --reverse
-# --check: if reversing applies cleanly, the patch is already in.
+# First compare the source tree with the complete patch series. This handles
+# later patches that intentionally touch a file changed by an earlier patch:
+# in that case an individual `apply --reverse --check` cannot recognize the
+# earlier patch because the later edit changes its context. Only patched files
+# are reconstructed, so this stays quick even though QEMU itself is large.
+patched_paths=()
+while IFS= read -r path; do
+    patched_paths+=("${path}")
+done < <(sed -n 's|^+++ b/||p' "${PATCHES_DIR}"/*.patch | sort -u)
+expected_dir="$(mktemp -d "${TMPDIR:-/tmp}/cdj3k-qemu-patches.XXXXXX")"
+for path in "${patched_paths[@]}"; do
+    mkdir -p "${expected_dir}/$(dirname "${path}")"
+    if git -C "${SRC_DIR}" cat-file -e "HEAD:${path}" 2>/dev/null; then
+        git -C "${SRC_DIR}" show "HEAD:${path}" > "${expected_dir}/${path}"
+    fi
+done
+series_applied=0
+if (
+    cd "${expected_dir}"
+    for patch in "${PATCHES_DIR}"/*.patch; do
+        git apply "${patch}"
+    done
+) >/dev/null 2>&1; then
+    series_applied=1
+    for path in "${patched_paths[@]}"; do
+        if [ -e "${expected_dir}/${path}" ]; then
+            cmp -s "${expected_dir}/${path}" "${SRC_DIR}/${path}" || series_applied=0
+        elif [ -e "${SRC_DIR}/${path}" ]; then
+            series_applied=0
+        fi
+    done
+fi
+rm -rf "${expected_dir}"
+
+# Otherwise apply each patch in order. Individual reverse checks retain
+# compatibility with older partially-patched source trees whose patches do
+# not overlap.
 patch_changed=0
 echo "==> Applying QEMU patches from $(basename "${PATCHES_DIR}")/"
-for p in "${PATCHES_DIR}"/*.patch; do
-    name="$(basename "$p")"
-    if git -C "${SRC_DIR}" apply --reverse --check "$p" >/dev/null 2>&1; then
-        echo "    [skip]   ${name} - already applied"
-        continue
-    fi
-    if ! git -C "${SRC_DIR}" apply --check "$p" 2>/dev/null; then
-        echo "    [FAIL]   ${name} - does not apply cleanly"
-        echo
-        echo "Upstream QEMU likely drifted under this patch's anchors."
-        echo "Regenerate the patch:"
-        echo "  - inspect: git -C ${SRC_DIR} apply --check ${p}"
-        echo "  - rebase the change manually, then:"
-        echo "      git -C ${SRC_DIR} diff -- <paths> > ${p}"
-        exit 1
-    fi
-    git -C "${SRC_DIR}" apply "$p"
-    echo "    [apply]  ${name}"
-    patch_changed=1
-done
+if [ "${series_applied}" = "1" ]; then
+    echo "    [skip]   complete patch series already applied"
+else
+    for p in "${PATCHES_DIR}"/*.patch; do
+        name="$(basename "$p")"
+        if git -C "${SRC_DIR}" apply --reverse --check "$p" >/dev/null 2>&1; then
+            echo "    [skip]   ${name} - already applied"
+            continue
+        fi
+        if ! git -C "${SRC_DIR}" apply --check "$p" 2>/dev/null; then
+            echo "    [FAIL]   ${name} - does not apply cleanly"
+            echo
+            echo "Upstream QEMU likely drifted under this patch's anchors."
+            echo "Regenerate the patch:"
+            echo "  - inspect: git -C ${SRC_DIR} apply --check ${p}"
+            echo "  - rebase the change manually, then:"
+            echo "      git -C ${SRC_DIR} diff -- <paths> > ${p}"
+            exit 1
+        fi
+        git -C "${SRC_DIR}" apply "$p"
+        echo "    [apply]  ${name}"
+        patch_changed=1
+    done
+fi
 
 # Force reconfigure when any patch landed - meson caches Kconfig results in
 # build.ninja, so a stale build dir won't pick up newly-enabled symbols.
@@ -147,7 +185,7 @@ fi
 # 4. Build
 # --------------------------------------------------------------------------
 
-JOBS="${JOBS:-$(sysctl -n hw.logicalcpu 2>/dev/null || nproc)}"
+JOBS="${JOBS:-$(sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 echo "==> Building with ${JOBS} jobs …"
 # `--enable-tools` configures a fleet of small helper tools (qemu-img,
 # qemu-io, qemu-nbd, qemu-storage-daemon, qemu-edid, elf2dmp,

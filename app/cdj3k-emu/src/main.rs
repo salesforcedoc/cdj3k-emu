@@ -167,6 +167,8 @@ fn main() {
     //   .app default          resolve from App Support; boot only when all
     //                         three files exist (wizard provisions them first)
     #[cfg(target_os = "macos")]
+    let _native_mixer_service;
+    #[cfg(target_os = "macos")]
     {
         use cdj3k_emu_runtime::{QemuConfig, QemuInstance, SocketVmnet, TapBridge};
 
@@ -186,6 +188,20 @@ fn main() {
         };
 
         let inst_settings = cdj3k_emu_storage::InstanceSettings::load_or_init(instance);
+        let audio_device_uid = cdj3k_emu_storage::load_audio_device_uid();
+        let cue_a_device_uid = cdj3k_emu_storage::load_cue_device_uid('A');
+        let cue_b_device_uid = cdj3k_emu_storage::load_cue_device_uid('B');
+        _native_mixer_service = cdj3k_emu_platform::native_mixer::NativeMixerService::start(
+            audio_device_uid.clone(),
+            cue_a_device_uid.clone(),
+            cue_b_device_uid.clone(),
+            inst_settings.audio_latency.effective().coreaudio_buffer_us,
+        )
+        .map_err(|error| {
+            eprintln!("cdj3k-emu: could not start native mixer contender: {error}");
+            error
+        })
+        .ok();
         // Seed the menu mirrors so the Audio/ALC checkboxes show the correct
         // initial state.  The runtime worker re-reads `audio_enabled` on every
         // restart via apply_menu_to_config and pushes `alc_enabled` to the
@@ -193,7 +209,10 @@ fn main() {
         {
             let mut s = cdj3k_emu_platform::menu_state::lock();
             s.audio_enabled = inst_settings.audio_enabled;
-            s.audio_device_uid = inst_settings.audio_device_uid.clone();
+            s.audio_device_uid = audio_device_uid.clone();
+            s.cue_a_device_uid = cue_a_device_uid;
+            s.cue_b_device_uid = cue_b_device_uid;
+            s.audio_latency = inst_settings.audio_latency;
             s.alc_enabled = inst_settings.alc_enabled;
             s.haptic_enabled = inst_settings.haptic_enabled;
             s.mods_enabled = inst_settings.mods_enabled && !no_mods;
@@ -232,7 +251,10 @@ fn main() {
         config.gdb_port = 1235 + instance as u16;
         config.emmc_img = emmc_img;
         config.audio = inst_settings.audio_enabled;
-        config.audio_device_uid = inst_settings.audio_device_uid.clone();
+        // The singleton native mixer is the sole CoreAudio device owner.
+        // QEMU only produces into its shared ring and must never open the
+        // selected hardware device independently.
+        config.audio_latency = inst_settings.audio_latency;
         config.mods_enabled = inst_settings.mods_enabled && !no_mods;
         config.mac = Some(inst_settings.mac);
         config.serial_log = serial_log;

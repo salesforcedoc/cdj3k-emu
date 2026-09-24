@@ -1,0 +1,139 @@
+diff --git a/audio/coreaudio.m b/audio/coreaudio.m
+--- a/audio/coreaudio.m
++++ b/audio/coreaudio.m
+@@ -46,17 +46,24 @@
+ };
+ 
+ #define CDJ3K_MIXER_MAGIC 0x31584d43u /* "CMX1" little-endian */
+-#define CDJ3K_MIXER_VERSION 2u
++#define CDJ3K_MIXER_VERSION 3u
+ #define CDJ3K_MIXER_CHANNELS 4u
+ #define CDJ3K_MIXER_HEADER_BYTES 64u
+ #define CDJ3K_MIXER_CHANNEL_BYTES 64u
++#define CDJ3K_MIXER_RING_BYTES (128u * 1024u)
++#define CDJ3K_MIXER_RING_BASE (CDJ3K_MIXER_HEADER_BYTES + \
++                               CDJ3K_MIXER_CHANNELS * CDJ3K_MIXER_CHANNEL_BYTES)
+ #define CDJ3K_MIXER_BYTES (CDJ3K_MIXER_HEADER_BYTES + \
+-                           CDJ3K_MIXER_CHANNELS * CDJ3K_MIXER_CHANNEL_BYTES)
++                           CDJ3K_MIXER_CHANNELS * CDJ3K_MIXER_CHANNEL_BYTES + \
++                           CDJ3K_MIXER_CHANNELS * CDJ3K_MIXER_RING_BYTES)
+ 
+ typedef struct Cdj3kMixerChannel {
+     _Atomic uint32_t control[6]; /* trim, high, mid, low, filter, fader */
+     _Atomic uint32_t peak[2];
+-    _Atomic uint32_t reserved[8];
++    _Atomic uint64_t ring_head;
++    _Atomic uint64_t ring_tail;
++    _Atomic uint32_t ring_active;
++    _Atomic uint32_t reserved[3];
+ } Cdj3kMixerChannel;
+ 
+ _Static_assert(sizeof(Cdj3kMixerChannel) == CDJ3K_MIXER_CHANNEL_BYTES,
+@@ -781,11 +788,24 @@
+     core->mixer_channel = (Cdj3kMixerChannel *)
+         ((uint8_t *)mapping + CDJ3K_MIXER_HEADER_BYTES
+          + channel_index * CDJ3K_MIXER_CHANNEL_BYTES);
++    extern void virtio_snd_external_ring_configure(
++        void *, _Atomic uint64_t *, _Atomic uint64_t *,
++        _Atomic uint32_t *, _Atomic uint32_t *);
++    uint8_t *ring = (uint8_t *)mapping + CDJ3K_MIXER_RING_BASE
++                    + channel_index * CDJ3K_MIXER_RING_BYTES;
++    virtio_snd_external_ring_configure(
++        ring, &core->mixer_channel->ring_head,
++        &core->mixer_channel->ring_tail, &header[3],
++        &core->mixer_channel->ring_active);
+ }
+ 
+ static void cdj3k_mixer_fini(CoreaudioVoiceOut *core)
+ {
+     cdj3k_mixer_publish_silence(core);
++    extern void virtio_snd_external_ring_configure(
++        void *, _Atomic uint64_t *, _Atomic uint64_t *,
++        _Atomic uint32_t *, _Atomic uint32_t *);
++    virtio_snd_external_ring_configure(NULL, NULL, NULL, NULL, NULL);
+     core->mixer_crossfader = NULL;
+     core->mixer_channel = NULL;
+     if (core->mixer_map) {
+@@ -866,6 +886,15 @@
+         return 0;
+     }
+ 
++    /* The singleton native mixer owns the shared ring and the only audible
++     * output stream. Keep this legacy QEMU IOProc silent and, critically, do
++     * not advance the ring tail. */
++    extern int virtio_snd_external_ring_is_active(void);
++    if (virtio_snd_external_ring_is_active()) {
++        memset(out, 0, len);
++        return 0;
++    }
++
+     /* cdj3k-emu: bypass fast-path is LOCK-FREE and runs BEFORE buf_mutex
+      * acquire. The ring is SPSC-atomic and bytes_per_frame / device_id are
+      * set once at init and never mutated, so the bypass read needs no
+diff --git a/hw/audio/virtio-snd.c b/hw/audio/virtio-snd.c
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -237,13 +237,49 @@
+  * preemption tails on the worker. 128 KB = 96 KB extra resident memory
+  * per QEMU instance, trivial vs. the 1.5 GiB guest RAM. */
+ #define VSND_BYPASS_BYTES (128 * 1024)
+-static uint8_t  vsnd_bypass_ring[VSND_BYPASS_BYTES];
+-static _Atomic uint64_t vsnd_bypass_head;   /* writer (vsnd_writer_thread_fn) */
+-static _Atomic uint64_t vsnd_bypass_tail;   /* reader (CoreAudio IOProc) */
++static uint8_t  vsnd_local_ring[VSND_BYPASS_BYTES];
++static _Atomic uint64_t vsnd_local_head;
++static _Atomic uint64_t vsnd_local_tail;
++static uint8_t *vsnd_external_ring;
++static _Atomic uint64_t *vsnd_external_head;
++static _Atomic uint64_t *vsnd_external_tail;
++static _Atomic uint32_t *vsnd_external_rate;
++static _Atomic uint32_t *vsnd_external_active;
++#define vsnd_bypass_ring (vsnd_external_ring ? vsnd_external_ring : vsnd_local_ring)
++#define vsnd_bypass_head (*(vsnd_external_head ? vsnd_external_head : &vsnd_local_head))
++#define vsnd_bypass_tail (*(vsnd_external_tail ? vsnd_external_tail : &vsnd_local_tail))
+ static _Atomic int      vsnd_bypass_active;
+ static int              vsnd_bypass_src_fmt; /* AUDIO_FORMAT_F32 or _S32 */
+ static _Atomic uint64_t vsnd_bypass_underrun_frames;
+ static _Atomic uint64_t vsnd_bypass_overrun_count;
++
++void virtio_snd_external_ring_configure(
++    void *ring, _Atomic uint64_t *head, _Atomic uint64_t *tail,
++    _Atomic uint32_t *rate, _Atomic uint32_t *active);
++void virtio_snd_external_ring_configure(
++    void *ring, _Atomic uint64_t *head, _Atomic uint64_t *tail,
++    _Atomic uint32_t *rate, _Atomic uint32_t *active)
++{
++    if (vsnd_external_active) {
++        atomic_store_explicit(vsnd_external_active, 0, memory_order_release);
++    }
++    vsnd_external_ring = ring;
++    vsnd_external_head = head;
++    vsnd_external_tail = tail;
++    vsnd_external_rate = rate;
++    vsnd_external_active = active;
++    if (ring && head && tail && active) {
++        atomic_store_explicit(tail, 0, memory_order_relaxed);
++        atomic_store_explicit(head, 0, memory_order_relaxed);
++        atomic_store_explicit(active, 1, memory_order_release);
++    }
++}
++
++int virtio_snd_external_ring_is_active(void);
++int virtio_snd_external_ring_is_active(void)
++{
++    return vsnd_external_ring != NULL;
++}
+ 
+ size_t virtio_snd_bypass_read(void *dst, size_t bytes)
+ {
+@@ -618,7 +654,9 @@
+  * ring-full so caller leaves buf in stream->queue for retry. */
+ static size_t vsnd_bypass_write_convert(const void *src, size_t src_bytes)
+ {
+-    uint32_t hal_rate   = coreaudio_get_active_samplerate();
++    uint32_t hal_rate = vsnd_external_rate
++        ? atomic_load_explicit(vsnd_external_rate, memory_order_acquire)
++        : coreaudio_get_active_samplerate();
+     uint32_t guest_rate = atomic_load_explicit(&vsnd_bypass_guest_rate,
+                                                memory_order_relaxed);
+     if (hal_rate == 0 || guest_rate == 0 || hal_rate == guest_rate) {

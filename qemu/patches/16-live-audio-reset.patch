@@ -1,0 +1,190 @@
+diff --git a/audio/audio.c b/audio/audio.c
+index 6f10ee4..05c7fdf 100644
+--- a/audio/audio.c
++++ b/audio/audio.c
+@@ -49,6 +49,8 @@ static AudioBackendClass *audio_be_class_by_name(const char *name)
+ }
+ 
+ static AudioBackend *default_audio_be;
++static audio_reset_handler_fn audio_reset_handler;
++static void *audio_reset_opaque;
+ 
+ static Object *get_audiodevs_root(void)
+ {
+@@ -58,10 +60,29 @@ static Object *get_audiodevs_root(void)
+ void audio_cleanup(void)
+ {
+     default_audio_be = NULL;
++    audio_reset_handler = NULL;
++    audio_reset_opaque = NULL;
+ 
+     object_unparent(get_audiodevs_root());
+ }
+ 
++void audio_register_reset_handler(audio_reset_handler_fn handler, void *opaque)
++{
++    assert(handler != NULL);
++    assert(audio_reset_handler == NULL ||
++           (audio_reset_handler == handler && audio_reset_opaque == opaque));
++    audio_reset_handler = handler;
++    audio_reset_opaque = opaque;
++}
++
++void audio_unregister_reset_handler(audio_reset_handler_fn handler, void *opaque)
++{
++    if (audio_reset_handler == handler && audio_reset_opaque == opaque) {
++        audio_reset_handler = NULL;
++        audio_reset_opaque = NULL;
++    }
++}
++
+ void audio_create_default_audiodevs(void)
+ {
+     for (int i = 0; audio_prio_list[i]; i++) {
+@@ -468,3 +489,12 @@ AudiodevList *qmp_query_audiodevs(Error **errp)
+     }
+     return ret;
+ }
++
++void qmp_x_cdj3k_audio_reset(Error **errp)
++{
++    if (!audio_reset_handler) {
++        error_setg(errp, "No live virtio-sound output is available to reset");
++        return;
++    }
++    audio_reset_handler(audio_reset_opaque, errp);
++}
+diff --git a/hw/audio/virtio-snd.c b/hw/audio/virtio-snd.c
+index 8912c68..7f31917 100644
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -37,6 +37,7 @@ static void virtio_snd_pcm_flush(VirtIOSoundPCMStream *stream);
+ static void virtio_snd_pcm_in_cb(void *data, int available);
+ static void virtio_snd_unrealize(DeviceState *dev);
+ static void virtio_snd_pcm_buffer_free(VirtIOSoundPCMBuffer *buffer);
++static const char *print_code(uint32_t code);
+ 
+ /* ============= CoreAudio bypass ring (Darwin only) =============
+  * SPSC ring: virtio-snd writes (main loop), CoreAudio IOProc reads (RT).
+@@ -1606,6 +1607,58 @@ static uint32_t virtio_snd_pcm_prepare(VirtIOSound *s, uint32_t stream_id)
+     return cpu_to_le32(VIRTIO_SND_S_OK);
+ }
+ 
++/* Recreate the host voice without resetting the virtio device or guest. The
++ * guest-visible stream object, negotiated parameters and START/STOP state stay
++ * intact. Closing first also stops the bypass writer and flushes outstanding
++ * completions before CoreAudio is reopened. */
++static void virtio_snd_audio_reset(void *opaque, Error **errp)
++{
++    VirtIOSound *s = opaque;
++    bool found_output = false;
++
++    for (uint32_t i = 0; i < s->snd_conf.streams; i++) {
++        VirtIOSoundPCMStream *stream = s->pcm.streams[i];
++        bool was_active;
++        uint32_t status;
++
++        if (!stream || stream->info.direction != VIRTIO_SND_D_OUTPUT) {
++            continue;
++        }
++        found_output = true;
++        WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
++            was_active = stream->active;
++        }
++
++        virtio_snd_pcm_close(stream);
++        status = virtio_snd_pcm_prepare(s, i);
++        if (status != cpu_to_le32(VIRTIO_SND_S_OK)) {
++            /* Keep the guest lifecycle state for a later retry. With no host
++             * voice, audio_be_write safely returns zero and leaves queued TX
++             * buffers intact instead of advancing or dropping them. */
++            WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
++                stream->active = was_active;
++            }
++            error_setg(errp,
++                       "Could not reopen virtio-sound stream %"PRIu32
++                       " (status 0x%08"PRIx32")",
++                       i, le32_to_cpu(status));
++            return;
++        }
++
++        /* pcm_prepare intentionally does not alter the guest lifecycle state.
++         * Reapply it to the new software voice so a playing deck resumes as
++         * soon as CoreAudio starts, while a stopped deck remains stopped. */
++        audio_be_set_active_out(s->audio_be, stream->voice.out, was_active);
++        if (was_active) {
++            vsnd_writer_wake();
++        }
++    }
++
++    if (!found_output) {
++        error_setg(errp, "No virtio-sound output stream is available to reset");
++    }
++}
++
+ static const char *print_code(uint32_t code)
+ {
+     #define CASE(CODE)            \
+@@ -2259,6 +2312,8 @@ static void virtio_snd_realize(DeviceState *dev, Error **errp)
+         }
+     }
+ 
++    audio_register_reset_handler(virtio_snd_audio_reset, vsnd);
++
+     return;
+ 
+ error_cleanup:
+@@ -2517,6 +2572,7 @@ static void virtio_snd_unrealize(DeviceState *dev)
+     VirtIOSound *vsnd = VIRTIO_SND(dev);
+     VirtIOSoundPCMStream *stream;
+ 
++    audio_unregister_reset_handler(virtio_snd_audio_reset, vsnd);
+     qemu_del_vm_change_state_handler(vsnd->vmstate);
+     trace_virtio_snd_unrealize(vsnd);
+ 
+diff --git a/include/qemu/audio.h b/include/qemu/audio.h
+index cff8a33..1b52499 100644
+--- a/include/qemu/audio.h
++++ b/include/qemu/audio.h
+@@ -33,6 +33,7 @@
+ #endif
+ 
+ typedef void (*audio_callback_fn) (void *opaque, int avail);
++typedef void (*audio_reset_handler_fn)(void *opaque, Error **errp);
+ 
+ typedef struct audsettings {
+     int freq;
+@@ -163,6 +164,11 @@ bool audio_be_is_active_in(AudioBackend *be, SWVoiceIn *sw);
+ 
+ void audio_cleanup(void);
+ 
++/* Register the live device callback used by the cdj3k audio-reset QMP
++ * command. Registration and QMP dispatch both run under the BQL. */
++void audio_register_reset_handler(audio_reset_handler_fn handler, void *opaque);
++void audio_unregister_reset_handler(audio_reset_handler_fn handler, void *opaque);
++
+ typedef struct st_sample st_sample;
+ 
+ void audio_add_audiodev(Audiodev *audio);
+diff --git a/qapi/audio.json b/qapi/audio.json
+index 38eb796..2804297 100644
+--- a/qapi/audio.json
++++ b/qapi/audio.json
+@@ -546,3 +546,17 @@
+ ##
+ { 'command': 'query-audiodevs',
+   'returns': ['Audiodev'] }
++
++##
++# @x-cdj3k-audio-reset:
++#
++# Tear down and reopen the active virtio-sound host output while
++# preserving the virtual machine and the guest stream's negotiated
++# state.
++#
++# Errors are returned when no resettable output exists or the selected
++# host audio device cannot be reopened.
++#
++# Since: cdj3k-emu 0.1.2
++##
++{ 'command': 'x-cdj3k-audio-reset' }

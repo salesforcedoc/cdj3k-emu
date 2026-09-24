@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use cdj3k_emu_platform::menu_state::AudioLatencySettings;
+
 /// Configuration for a single QEMU CDJ-3000 instance.
 #[derive(Clone, Debug)]
 pub struct QemuConfig {
@@ -21,11 +23,9 @@ pub struct QemuConfig {
     /// Expose virtio-sound-device (CoreAudio backend).
     pub audio: bool,
 
-    /// CoreAudio device UID (kAudioDevicePropertyDeviceUID) to bind the
-    /// output stream to. `None` means "follow system default output".
-    /// Forwarded to QEMU as `out.device-uid=<UID>` on `-audiodev coreaudio`.
-    /// Only meaningful when `audio == true`.
-    pub audio_device_uid: Option<String>,
+    /// Per-player host/guest buffering profile. Applied at QEMU launch because
+    /// the guest transfer size is fixed when ALSA negotiates the stream.
+    pub audio_latency: AudioLatencySettings,
 
     /// Boot into EP122 service/test mode.
     pub service_mode: bool,
@@ -89,7 +89,7 @@ impl QemuConfig {
             hvf: std::env::var_os("CDJ3K_EMU_TCG").is_none(),
             shm: false,
             audio: false,
-            audio_device_uid: None,
+            audio_latency: AudioLatencySettings::default(),
             service_mode: false,
             mods_enabled: false,
             emmc_img: None,
@@ -119,6 +119,14 @@ impl QemuConfig {
     /// `crates/cdj3k-emu-streams/src/jog_stream.rs`.
     pub fn jog_shm_path(&self) -> PathBuf {
         self.sock_dir().join("jog.shm")
+    }
+
+    /// FIFO consumed by the host-side Pro DJ Link status monitor. QEMU's
+    /// filter-dump writes a pcap stream here, which lets us inspect this
+    /// player's own transmitted status even when slirp/NAT would not route
+    /// broadcasts back to a host UDP socket.
+    pub fn prolink_capture_path(&self) -> PathBuf {
+        self.sock_dir().join("prolink.pcap.pipe")
     }
 
     /// Placeholder backing file for the always-present USB virtio-blk slot.
@@ -242,34 +250,30 @@ impl QemuConfig {
             "virtio-rng-device,rng=rng0".into(),
         ]);
 
+        // A genuine USB HID keyboard lets Xorg/JUCE deliver host typing to
+        // whichever firmware TextEditor currently owns keyboard focus. The
+        // stock on-screen keyboard gives its editor focus when shown, so no
+        // private firmware callbacks or screen-coordinate guesses are needed.
+        // EHCI's PCI driver, USB HID and evdev are built into the guest kernel
+        // (unlike xHCI PCI, which is a module absent from the stock initramfs).
+        args.extend([
+            "-device".into(),
+            "usb-ehci,id=host_input_ehci".into(),
+            "-device".into(),
+            "usb-kbd,bus=host_input_ehci.0,id=host_keyboard".into(),
+        ]);
+
         if self.audio {
-            // Build the audiodev string. When the user pinned a specific
-            // device via the per-instance Audio Output picker, append
-            // `out.device-uid=<UID>` so the patched coreaudio.m binds to
-            // that device instead of the system default output.
-            // out.buffer-length=5000 (5 ms): a previous bump to 30000 us
-            // did not help the audible pops because Apple Silicon's
-            // built-in HAL buffer-frame-size range clamped the request
-            // down to ~13.78 ms regardless, AND the underlying cause is
-            // not HAL-side scheduling jitter but guest VCPU starvation
-            // under host CPU/GPU stress. Reverted to 5 ms so we don't
-            // pay latency we don't get any value for. Real fix is RT
-            // scheduling for the HVF VCPU threads (see hvf-accel-ops
-            // patch) so the guest's PCM thread can't be preempted.
-            let mut audiodev =
-                String::from("coreaudio,id=audio0,in.voices=0,out.buffer-length=5000");
-            if let Some(uid) = self.audio_device_uid.as_deref().filter(|s| !s.is_empty()) {
-                // CoreAudio UIDs contain ':', spaces, and other chars QEMU's
-                // -audiodev parser passes through untouched (it splits on
-                // ',' and '=' only); no escaping needed in practice.
-                audiodev.push_str(",out.device-uid=");
-                audiodev.push_str(uid);
-            }
+            let tuning = self.audio_latency.effective();
             args.extend([
                 "-audiodev".into(),
-                audiodev,
+                "coreaudio,id=audio0,in.voices=0".into(),
                 "-device".into(),
-                "virtio-sound-device,audiodev=audio0,streams=1".into(),
+                format!(
+                    "virtio-sound-device,audiodev=audio0,streams=1,x-prefill-frames={},x-tx-batch-periods={}",
+                    tuning.startup_prefill_frames,
+                    tuning.guest_transfer_frames / 64
+                ),
             ]);
         }
         // When disabled: no virtio-sound device. The guest auto-loads
@@ -305,6 +309,18 @@ impl QemuConfig {
                 "virtio-net-device,netdev=net0,mrg_rxbuf=off".into(),
             ]);
         }
+
+        // Passively mirror both directions at the QEMU network boundary. The
+        // destination is a FIFO, so this has bounded memory/disk use and does
+        // not contend for Pro DJ Link's UDP ports with rekordbox or another
+        // emulator instance. 512 bytes covers every known CDJ status packet.
+        args.extend([
+            "-object".into(),
+            format!(
+                "filter-dump,id=prolink0,netdev=net0,queue=all,file={},maxlen=512",
+                self.prolink_capture_path().display()
+            ),
+        ]);
 
         args.extend(["-device".into(), "virtio-serial-device,max_ports=8".into()]);
         for (name, nr) in &[

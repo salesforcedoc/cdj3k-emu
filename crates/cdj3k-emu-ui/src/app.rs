@@ -1,17 +1,21 @@
+mod audio_latency;
 mod bloom;
 mod boot_overlay;
 mod buttons;
 mod firmware_wizard;
 mod frame_inject;
 mod jog_physics;
+mod keyboard;
 mod lcd_texture;
 mod lcd_touch;
+mod midi;
+mod mixer;
 mod ui;
 mod viewports;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui::Color32;
 
@@ -111,6 +115,9 @@ pub struct CdjApp {
     jog_release_touch_pulse_remaining_sec: f32,
     /// Scroll interaction hold timer (s). While > 0, scroll semantics stay active.
     jog_scroll_hold_sec: f32,
+    /// Brief hold while MIDI jog motion is arriving, to avoid double-counting
+    /// the MIDI delta as free coast in `tick_jog`.
+    midi_jog_motion_hold_sec: f32,
     /// Effective touch semantic currently encoded into `jog_touch`.
     jog_touch_active: bool,
     /// JOG ADJUST rotary value in [0, 1]. `0` = LIGHT (long coast), `1` = HEAVY (quick brake).
@@ -118,6 +125,7 @@ pub struct CdjApp {
     jog_screen_popped: bool,
     main_screen_popped: bool,
     debug_screen_popped: bool,
+    mixer_open: bool,
     rotary: u16,
     /// `0.0..=1.0`, piecewise-mapped to `0x0000..=0xFFFF` (centre → `TEMPO_CENTER`).
     tempo: f32,
@@ -125,6 +133,8 @@ pub struct CdjApp {
     direction: cdj3k_emu_subucom::Direction,
 
     lcd_touch: Option<(u16, u16)>,
+    /// First observed press time, used to keep a brief mouse click visible to the guest.
+    lcd_touch_pressed_at: Option<Instant>,
     /// `true` while a Ctrl+click latch is active: touch coordinate is frozen until Ctrl is released.
     lcd_touch_ctrl_latched: bool,
     /// `true` after scrolling on the LCD: next click fires the rotary press instead of a touch.
@@ -135,6 +145,22 @@ pub struct CdjApp {
     held_btn: Option<(usize, u8)>,
     /// Buttons latched by ctrl+click - stay pressed until ctrl is released.
     latched_btns: HashSet<(usize, u8)>,
+    /// MIDI presses keyed by source/channel/message/control so simultaneous
+    /// controllers cannot release one another's buttons.
+    midi_held_btns: HashMap<midi::MidiButtonId, midi::MidiHeldButton>,
+    /// A separate touch state lets MIDI platter turns scratch only while the
+    /// controller's touch sensor is pressed.
+    midi_jog_touch_held: HashSet<(u64, u8, cdj3k_emu_storage::MidiMessageKind, u8)>,
+    /// Held activation controls, used to raise a deck only on a press edge.
+    midi_activate_deck_held: HashSet<(u64, u8, cdj3k_emu_storage::MidiMessageKind, u8)>,
+    midi_jog_activity: [midi::MidiJogActivity; 2],
+    midi_controls: midi::MidiControls,
+    midi_assignments: cdj3k_emu_storage::MidiAssignments,
+    mixer_midi_assignments: cdj3k_emu_storage::MidiMixerAssignments,
+    midi_learn: midi::MidiLearnState,
+    audio_latency: audio_latency::AudioLatencyPanel,
+    audio_capture: cdj3k_emu_platform::audio_capture::AudioCaptureControl,
+    mixer: mixer::MixerPanel,
 
     nav_angle: f32,
     /// Sub-detent scroll accumulator (px). Fires a rotary tick each `NAV_SCROLL_PX_PER_TICK` px.
@@ -161,6 +187,7 @@ pub struct CdjApp {
 
     /// Latest LED state received from the guest (updated on each new frame).
     led_state: LedState,
+    midi_led_frame_seen: bool,
 
     bloom: Option<bloom::SharedBloom>,
     /// LCD screen rects captured each frame (egui coords, Y-down) - fed to the bloom exclusion mask.
@@ -264,7 +291,16 @@ impl CdjApp {
         egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         egui_ctx.set_zoom_factor(1.0);
         let app_settings = cdj3k_emu_storage::AppSettings::load();
+        let instance_id = menu_state::lock().current_instance_id;
+        let midi_assignments =
+            cdj3k_emu_storage::InstanceSettings::load_or_init(instance_id).midi_assignments;
+        let mixer_midi_assignments = cdj3k_emu_storage::load_mixer_midi_assignments();
         let repaint_gate = RepaintGate::new(egui_ctx.clone(), MIN_FRAME_INTERVAL);
+        let midi_controls = midi::MidiControls::new(repaint_gate.clone());
+        let audio_latency = audio_latency::AudioLatencyPanel::new(menu_state::lock().audio_latency);
+        let audio_capture =
+            cdj3k_emu_platform::audio_capture::AudioCaptureControl::new(instance_id);
+        let mixer = mixer::MixerPanel::new(instance_id);
         Self {
             jog_pos: 0,
             jog_vel: JOG_VEL_INIT,
@@ -279,20 +315,34 @@ impl CdjApp {
             jog_grip_drag: false,
             jog_release_touch_pulse_remaining_sec: 0.0,
             jog_scroll_hold_sec: 0.0,
+            midi_jog_motion_hold_sec: 0.0,
             jog_touch_active: false,
             jog_adjust: app_settings.jog_adjust,
             jog_screen_popped: false,
             main_screen_popped: false,
             debug_screen_popped: false,
+            mixer_open: false,
             rotary: ROTARY_NEUTRAL,
             tempo: TEMPO_INIT,
             vinyl_speed: app_settings.vinyl_speed,
             direction: cdj3k_emu_subucom::Direction::Forward,
             lcd_touch: None,
+            lcd_touch_pressed_at: None,
             lcd_touch_ctrl_latched: false,
             lcd_nav_mode: false,
             held_btn: None,
             latched_btns: HashSet::new(),
+            midi_held_btns: HashMap::new(),
+            midi_jog_touch_held: HashSet::new(),
+            midi_activate_deck_held: HashSet::new(),
+            midi_jog_activity: [midi::MidiJogActivity::default(); 2],
+            midi_controls,
+            midi_assignments,
+            mixer_midi_assignments,
+            midi_learn: midi::MidiLearnState::new(),
+            audio_latency,
+            audio_capture,
+            mixer,
             nav_angle: 0.0,
             nav_scroll_accum: 0.0,
             jog_adjust_scroll_accum: 0.0,
@@ -306,6 +356,7 @@ impl CdjApp {
             jog_tex_id: None,
             jog_corner_label_colors: [ui::COL_BTN_TEXT; 4],
             led_state: LedState::default(),
+            midi_led_frame_seen: false,
             bloom: None,
             bloom_excludes: Vec::new(),
             status: "Starting...".to_owned(),
@@ -365,6 +416,12 @@ impl CdjApp {
         latched[..n].sort_unstable();
         n.hash(&mut h);
         latched[..n].hash(&mut h);
+        let mut midi_buttons = [0u8; miso_frame::MISO_SIZE];
+        for held in self.midi_held_btns.values() {
+            let (byte, mask) = held.button;
+            midi_buttons[byte] |= mask;
+        }
+        midi_buttons.hash(&mut h);
         ((self.shade_alpha.clamp(0.0, 1.0) * 255.0) as u8).hash(&mut h);
         h.finish()
     }
@@ -418,6 +475,7 @@ impl eframe::App for CdjApp {
 
         MENU_SETUP.call_once(cdj3k_emu_platform::menu::setup_menu);
         self.poll_menu_state();
+        self.forward_host_keyboard(ctx);
 
         // Blank LCD textures after a QEMU exit so popouts go black instead
         // of holding the last captured frame.
@@ -469,7 +527,10 @@ impl eframe::App for CdjApp {
             self.ctrl_stream.take()
         } {
             self.led_state = ls;
+            self.midi_led_frame_seen = true;
         }
+
+        self.poll_midi(ctx);
 
         let dt = ctx.input(|i| i.stable_dt.max(1.0e-4));
         self.fps_smooth = FPS_EMA_ALPHA * (1.0 / dt) + (1.0 - FPS_EMA_ALPHA) * self.fps_smooth;
@@ -490,8 +551,12 @@ impl eframe::App for CdjApp {
         {
             puffin::profile_scope!("status_fmt");
             self.status = format!(
-                "{}  {}  adj={:.2} ω={:+.2}rad/s",
-                disp_state, jog_state, self.jog_adjust, self.jog_omega
+                "{}  {}  midi={}  adj={:.2} ω={:+.2}rad/s",
+                disp_state,
+                jog_state,
+                self.midi_controls.connected_port_count(),
+                self.jog_adjust,
+                self.jog_omega
             );
         }
 
@@ -539,6 +604,10 @@ impl eframe::App for CdjApp {
         // provisions firmware, so it must be reachable precisely when QEMU
         // isn't running.
         self.wizard.show(ctx);
+        self.show_midi_learn(ctx);
+        self.audio_latency.show(ctx);
+        self.mixer.tick_persistence();
+        self.mixer_open = self.mixer.show(ctx, self.mixer_open);
 
         // Secondary viewports: stay hidden until the shade is fully gone -
         // they aren't covered by the shade overlay.
@@ -556,6 +625,7 @@ impl eframe::App for CdjApp {
             s.jog_screen_popped = self.jog_screen_popped;
             s.main_screen_popped = self.main_screen_popped;
             s.debug_screen_popped = self.debug_screen_popped;
+            s.mixer_open = self.mixer_open;
         }
 
         cdj3k_emu_platform::menu::sync_menu();
@@ -566,6 +636,8 @@ impl eframe::App for CdjApp {
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
+        self.audio_capture.stop();
+        self.mixer.flush();
         // Inject the power-off MISO frame directly: on app exit the egui loop
         // is already stopped, so `poll_menu_state` will never consume
         // POWER_OFF_STIMULI_REQUESTED. Without this, instance.stop()'s 8 s
@@ -645,21 +717,43 @@ impl CdjApp {
     /// Pull menu state (set by the native macOS menu or the egui menu).
     /// Also handles power-off and wizard-open requests.
     fn poll_menu_state(&mut self) {
-        let (jog, main, debug, want_wizard, want_poweroff) = {
+        let (
+            jog,
+            main,
+            debug,
+            mixer,
+            want_wizard,
+            want_midi_learn,
+            want_audio_latency,
+            audio_latency_settings,
+            want_poweroff,
+        ) = {
             let mut s = menu_state::lock();
             (
                 s.jog_screen_popped,
                 s.main_screen_popped,
                 s.debug_screen_popped,
+                s.mixer_open,
                 std::mem::take(&mut s.firmware_wizard_requested),
+                std::mem::take(&mut s.midi_learn_requested),
+                std::mem::take(&mut s.audio_latency_requested),
+                s.audio_latency,
                 std::mem::take(&mut s.power_off_stimuli_requested),
             )
         };
         self.jog_screen_popped = jog;
         self.main_screen_popped = main;
         self.debug_screen_popped = debug;
+        self.mixer_open = mixer;
         if want_wizard {
             self.wizard.open = true;
+        }
+        if want_midi_learn {
+            self.mixer
+                .request_midi_learn(menu_state::lock().current_instance_id.saturating_sub(1));
+        }
+        if want_audio_latency {
+            self.audio_latency.open(audio_latency_settings);
         }
         if want_poweroff {
             let mut f = self.build_current_frame();

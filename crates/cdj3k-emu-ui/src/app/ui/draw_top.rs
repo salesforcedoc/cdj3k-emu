@@ -445,21 +445,25 @@ impl CdjApp {
                     ui.id().with("lcd_touch"),
                     egui::Sense::click_and_drag(),
                 );
-                self.apply_lcd_touch(crate::app::LcdTouchCapture {
-                    hovered: lcd_resp.hovered(),
-                    scroll_y: ui.input(|i| i.raw_scroll_delta.y),
-                    pointer_moved: ui.input(|i| i.pointer.delta().length_sq() > 0.0),
-                    is_down: lcd_resp.is_pointer_button_down_on(),
-                    ctrl: ui.input(|i| i.modifiers.ctrl),
-                    right_down: ui.input(|i| {
-                        i.pointer.button_down(egui::PointerButton::Secondary)
-                            && i.pointer
-                                .hover_pos()
-                                .map_or(false, |p| display_rect.contains(p))
-                    }),
-                    interact_pos: lcd_resp.interact_pointer_pos(),
-                    display_rect,
-                });
+                self.apply_lcd_touch(
+                    crate::app::LcdTouchCapture {
+                        hovered: lcd_resp.hovered(),
+                        scroll_y: ui.input(|i| i.raw_scroll_delta.y),
+                        pointer_moved: ui.input(|i| i.pointer.delta().length_sq() > 0.0),
+                        is_down: lcd_resp.is_pointer_button_down_on(),
+                        clicked: lcd_resp.clicked(),
+                        ctrl: ui.input(|i| i.modifiers.ctrl),
+                        right_down: ui.input(|i| {
+                            i.pointer.button_down(egui::PointerButton::Secondary)
+                                && i.pointer
+                                    .hover_pos()
+                                    .map_or(false, |p| display_rect.contains(p))
+                        }),
+                        interact_pos: lcd_resp.interact_pointer_pos(),
+                        display_rect,
+                    },
+                    ui.ctx(),
+                );
             }
 
             draw_bordered_rect_section(

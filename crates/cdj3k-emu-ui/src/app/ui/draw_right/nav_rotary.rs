@@ -137,8 +137,13 @@ impl CdjApp {
 
         // Click → BTN_ROTARY_PRESS with ctrl-latch support.
         let is_down = resp.is_pointer_button_down_on();
+        let clicked = resp.clicked();
         let ctrl = ui.input(|i| i.modifiers.ctrl);
-        self.handle_btn_interaction(is_down, ctrl, miso_frame::BTN_ROTARY_PRESS);
+        self.handle_btn_interaction(is_down, clicked, ctrl, miso_frame::BTN_ROTARY_PRESS);
+        if clicked && !is_down {
+            ui.ctx()
+                .request_repaint_after(crate::app::ANIM_REPAINT_INTERVAL);
+        }
 
         // Radii for the bezel ring and buttons.
         let bezel_inner_r = r_outer + s(NAV_BEZEL_INNER_GAP_REF);

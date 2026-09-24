@@ -1,5 +1,6 @@
 //! Background thread that polls `menu_state` and drives QemuInstance / UsbManager.
 
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -60,6 +61,10 @@ fn run(mut instance: Option<QemuInstance>, mut config: QemuConfig, prebuilt_net:
     // Latched per QEMU lifetime - cleared on restart so a fresh kernel module
     // load gets the user's persisted ALC value pushed once cfg.sock is up.
     let mut alc_pushed_for_boot = false;
+    // QEMU's send-key command uses a timed input queue. Keep our own bounded
+    // queue and feed it one character per worker tick so large clipboard
+    // pastes cannot overflow QEMU's 1024-event queue or leave Shift stuck.
+    let mut pending_keyboard = VecDeque::new();
     // Storage to re-mount after the next QEMU boot (deferred until cfg.sock is ready).
     let mut pending_remount: Option<PendingRemount> = None;
     // Populate the interface cache immediately so the menu has data on first open.
@@ -129,7 +134,11 @@ fn run(mut instance: Option<QemuInstance>, mut config: QemuConfig, prebuilt_net:
                 boot: std::mem::take(&mut s.qemu_boot_requested) && instance.is_none(),
                 stop: std::mem::take(&mut s.stop_requested),
                 audio_toggle: std::mem::take(&mut s.audio_toggle_requested),
+                audio_reset: std::mem::take(&mut s.audio_reset_requested),
                 audio_device_toggle: std::mem::take(&mut s.audio_device_toggle_requested),
+                cue_a_device_toggle: std::mem::take(&mut s.cue_a_device_toggle_requested),
+                cue_b_device_toggle: std::mem::take(&mut s.cue_b_device_toggle_requested),
+                audio_latency_apply: std::mem::take(&mut s.audio_latency_apply_requested),
                 alc_toggle: std::mem::take(&mut s.alc_toggle_requested),
                 restart: std::mem::take(&mut s.restart_requested),
                 usb_create: std::mem::take(&mut s.usb_create_req),
@@ -139,6 +148,9 @@ fn run(mut instance: Option<QemuInstance>, mut config: QemuConfig, prebuilt_net:
                 usb_phys_retry: std::mem::take(&mut s.usb_phys_retry_req),
                 audio_enabled: s.audio_enabled,
                 audio_device_uid: s.audio_device_uid.clone(),
+                cue_a_device_uid: s.cue_a_device_uid.clone(),
+                cue_b_device_uid: s.cue_b_device_uid.clone(),
+                audio_latency: s.audio_latency,
                 alc_enabled: s.alc_enabled,
                 haptic_toggle: std::mem::take(&mut s.haptic_toggle_requested),
                 haptic_enabled: s.haptic_enabled,
@@ -146,6 +158,7 @@ fn run(mut instance: Option<QemuInstance>, mut config: QemuConfig, prebuilt_net:
                 mods_enabled: s.mods_enabled,
                 selected_iface: s.selected_interface,
                 usb_virtual_img: s.usb_virtual_img.clone(),
+                keyboard_input: std::mem::take(&mut s.guest_keyboard_input),
             }
         };
 
@@ -199,13 +212,68 @@ fn run(mut instance: Option<QemuInstance>, mut config: QemuConfig, prebuilt_net:
         }
 
         // ── Audio output device selection ────────────────────────────────────
-        // Same shape as audio_toggle: persist and trigger a restart so the
-        // new `-audiodev coreaudio,out.dev=<UID>` arg takes effect.
+        // Persist the global mixer output selection and ask the singleton
+        // native CoreAudio engine to reopen on that device. QEMU and the
+        // guest keep running throughout the switch.
         if req.audio_device_toggle {
-            persist_inst(config.instance_id, |s| {
-                s.audio_device_uid = req.audio_device_uid.clone();
-            });
-            restart_pending = true;
+            if let Err(error) =
+                cdj3k_emu_storage::save_audio_device_uid(req.audio_device_uid.as_deref())
+            {
+                eprintln!("cdj3k-emu: persisting shared audio device failed: {error}");
+            }
+            #[cfg(target_os = "macos")]
+            if let Err(error) = cdj3k_emu_platform::native_mixer::request_output_device(
+                req.audio_device_uid.as_deref(),
+            ) {
+                eprintln!("cdj3k-emu: native mixer device switch failed: {error}");
+            }
+        }
+        for (bus, changed, uid) in [
+            ('A', req.cue_a_device_toggle, &req.cue_a_device_uid),
+            ('B', req.cue_b_device_toggle, &req.cue_b_device_uid),
+        ] {
+            if !changed {
+                continue;
+            }
+            if let Err(error) = cdj3k_emu_storage::save_cue_device_uid(bus, uid.as_deref()) {
+                eprintln!("cdj3k-emu: persisting Cue {bus} output failed: {error}");
+            }
+            #[cfg(target_os = "macos")]
+            if let Err(error) =
+                cdj3k_emu_platform::native_mixer::request_cue_output_device(bus, uid.as_deref())
+            {
+                eprintln!("cdj3k-emu: Cue {bus} device switch failed: {error}");
+            }
+        }
+
+        // The guest transfer size is negotiated during ALSA hw_params, so a
+        // profile change is persisted immediately and restarts only when this
+        // player currently has an active audio device.
+        if req.audio_latency_apply {
+            persist_inst(config.instance_id, |s| s.audio_latency = req.audio_latency);
+            #[cfg(target_os = "macos")]
+            if let Err(error) = cdj3k_emu_platform::native_mixer::request_latency(
+                req.audio_latency.effective().coreaudio_buffer_us,
+            ) {
+                eprintln!("cdj3k-emu: native mixer latency update failed: {error}");
+            }
+            if req.audio_enabled && instance.is_some() {
+                restart_pending = true;
+            }
+        }
+
+        // Reset only the singleton native output. The guest PCM transport is
+        // independent of host-device ownership and does not need a QMP reset.
+        if req.audio_reset && !restart_pending {
+            #[cfg(target_os = "macos")]
+            match cdj3k_emu_platform::native_mixer::request_audio_reset() {
+                Ok(()) => eprintln!("cdj3k-emu: native audio output reset requested"),
+                Err(error) => {
+                    let message = format!("Could not reset the native audio output: {error}");
+                    eprintln!("cdj3k-emu: {message}");
+                    menu_state::lock().audio_error_message = Some(message);
+                }
+            }
         }
 
         // ── ALC toggle ───────────────────────────────────────────────────────
@@ -247,9 +315,31 @@ fn run(mut instance: Option<QemuInstance>, mut config: QemuConfig, prebuilt_net:
 
         // ── Latency mirror ───────────────────────────────────────────────────
         if let Some(lat) = cfg_client.latency() {
+            let (host_ms, total_ms) = cdj3k_emu_platform::mixer::MixerShared::open()
+                .ok()
+                .map(|shared| {
+                    let rate = shared.output_rate();
+                    let (buffer, safety, device) = shared.host_latency_frames();
+                    let frames = buffer.saturating_add(safety).saturating_add(device);
+                    let host = if rate == 0 {
+                        0
+                    } else {
+                        ((frames as u64 * 1000 + rate as u64 / 2) / rate as u64) as u32
+                    };
+                    (host, lat.guest_ms.saturating_add(host))
+                })
+                .unwrap_or((0, lat.guest_ms));
             menu_state::lock().latency_packed =
-                menu_state::pack_latency(lat.total_ms, lat.guest_ms, lat.host_ms);
+                menu_state::pack_latency(total_ms, lat.guest_ms, host_ms);
         }
+
+        // Mirror this guest's own outbound Pro DJ Link CDJ-status packet for
+        // the debug viewport. The capture lives at QEMU's net boundary, so it
+        // is independent of the selected host network backend and never binds
+        // the protocol's UDP ports.
+        menu_state::lock().prolink_track_status = instance
+            .as_ref()
+            .and_then(QemuInstance::prolink_track_status);
 
         // ── Restart ──────────────────────────────────────────────────────────
         if restart_pending {
@@ -277,6 +367,22 @@ fn run(mut instance: Option<QemuInstance>, mut config: QemuConfig, prebuilt_net:
                 }
                 Err(e) => eprintln!("cdj3k-emu: restart failed: {e:?}"),
             }
+        }
+
+        // QemuInstance owns the one QMP connection, so host keyboard input is
+        // drained here rather than opening a competing connection from egui.
+        let keyboard_room =
+            menu_state::MAX_GUEST_KEYBOARD_QUEUE.saturating_sub(pending_keyboard.len());
+        pending_keyboard.extend(req.keyboard_input.into_iter().take(keyboard_room));
+        if let Some(ref mut inst) = instance {
+            if let Some(input) = pending_keyboard.pop_front() {
+                if let Err(e) = inst.qmp().send_guest_key(input) {
+                    eprintln!("cdj3k-emu: keyboard input failed: {e:?}");
+                    pending_keyboard.clear();
+                }
+            }
+        } else {
+            pending_keyboard.clear();
         }
 
         // ── Network interface selection ───────────────────────────────────────
@@ -548,7 +654,11 @@ struct Requests {
     boot: bool,
     stop: bool,
     audio_toggle: bool,
+    audio_reset: bool,
     audio_device_toggle: bool,
+    cue_a_device_toggle: bool,
+    cue_b_device_toggle: bool,
+    audio_latency_apply: bool,
     alc_toggle: bool,
     restart: bool,
     usb_create: bool,
@@ -558,6 +668,9 @@ struct Requests {
     usb_phys_retry: bool,
     audio_enabled: bool,
     audio_device_uid: Option<String>,
+    cue_a_device_uid: Option<String>,
+    cue_b_device_uid: Option<String>,
+    audio_latency: menu_state::AudioLatencySettings,
     alc_enabled: bool,
     haptic_toggle: bool,
     haptic_enabled: bool,
@@ -565,6 +678,7 @@ struct Requests {
     mods_enabled: bool,
     selected_iface: u32,
     usb_virtual_img: Option<std::path::PathBuf>,
+    keyboard_input: Vec<menu_state::GuestKeyboardInput>,
 }
 
 fn apply_menu_to_config(config: &mut QemuConfig) {
@@ -572,7 +686,8 @@ fn apply_menu_to_config(config: &mut QemuConfig) {
     config.service_mode = s.service_mode;
     config.mods_enabled = s.mods_enabled;
     config.audio = s.audio_enabled;
-    config.audio_device_uid = s.audio_device_uid.clone();
+    // Output routing is owned by the singleton native mixer, outside QEMU.
+    config.audio_latency = s.audio_latency;
 }
 
 /// Mark the virtual USB image at `path` as the current mount for this

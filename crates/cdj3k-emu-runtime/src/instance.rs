@@ -63,6 +63,7 @@ pub fn kill_qemu_child_now() {
 use cdj3k_emu_platform::menu_state;
 
 use crate::config::QemuConfig;
+use crate::prolink::{parse_mac, ProlinkMonitor};
 use crate::qmp::{QmpClient, QmpError};
 
 #[derive(Debug)]
@@ -89,6 +90,8 @@ struct Inner {
     /// Held for the lifetime of the instance - blocks any other cdj3k-emu process
     /// from booting against the same eMMC qcow2 (qcow2 is not concurrent-safe).
     _emmc_lock: Option<std::fs::File>,
+    /// Passive reader for the bounded pcap stream produced by QEMU's netfilter.
+    prolink_monitor: Option<ProlinkMonitor>,
 }
 
 /// A running QEMU instance.  Call `stop()` or let `Drop` send a quit + SIGKILL.
@@ -96,6 +99,7 @@ pub struct QemuInstance {
     config: QemuConfig,
     inner: Inner,
     running: Arc<AtomicBool>,
+    cleanup_on_drop: bool,
 }
 
 impl QemuInstance {
@@ -106,6 +110,21 @@ impl QemuInstance {
         kill_stale(config.qmp_port, &config.sock_dir());
 
         std::fs::create_dir_all(config.sock_dir()).map_err(InstanceError::SockDir)?;
+
+        let mac = config.mac.as_deref().and_then(parse_mac).unwrap_or([
+            0x0a,
+            0,
+            0,
+            0,
+            0,
+            (config.instance_id & 0xff) as u8,
+        ]);
+        let prolink_monitor = ProlinkMonitor::start(
+            &config.prolink_capture_path(),
+            config.instance_id.min(u8::MAX as u32) as u8,
+            mac,
+        )
+        .map_err(InstanceError::SockDir)?;
 
         // Exclusive non-blocking flock on the eMMC qcow2 - prevents two cdj3k-emu
         // instances from corrupting the same image. The lock is released when
@@ -165,8 +184,22 @@ impl QemuInstance {
         );
 
         let tap_fd = config.net_tap_fd;
+        // Ensure the shared mixer file exists before the QEMU child maps it.
+        // Dropping this Rust mapping is fine: the file persists and the UI
+        // owns its own live mapping.
+        let mixer_channel = config.instance_id.saturating_sub(1).min(3);
+        let mixer_shared =
+            cdj3k_emu_platform::mixer::MixerShared::open().map_err(InstanceError::SockDir)?;
+        mixer_shared.set_target_audio_frames(
+            mixer_channel as usize,
+            config.audio_latency.effective().startup_prefill_frames,
+        );
+        let mixer_path = cdj3k_emu_platform::mixer::MixerShared::path();
         let mut cmd = std::process::Command::new(&self_exe);
-        cmd.arg("--qemu-worker").args(&qemu_argv);
+        cmd.arg("--qemu-worker")
+            .args(&qemu_argv)
+            .env("CDJ3K_EMU_MIXER_SHM", &mixer_path)
+            .env("CDJ3K_EMU_MIXER_CHANNEL", mixer_channel.to_string());
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(move || {
@@ -217,9 +250,11 @@ impl QemuInstance {
                 qmp,
                 pid,
                 _emmc_lock: emmc_lock,
+                prolink_monitor: Some(prolink_monitor),
             },
             config,
             running,
+            cleanup_on_drop: true,
         })
     }
 
@@ -229,6 +264,12 @@ impl QemuInstance {
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
+    }
+
+    pub fn prolink_track_status(
+        &self,
+    ) -> Option<cdj3k_emu_platform::menu_state::ProlinkTrackStatus> {
+        self.inner.prolink_monitor.as_ref()?.latest()
     }
 
     /// Graceful stop: SPI power-off stimuli → 8 s for EP122 USB cleanup →
@@ -272,21 +313,16 @@ impl QemuInstance {
         self.stop();
         // Release the flock before spawn tries to re-acquire it on a new fd.
         self.inner._emmc_lock = None;
+        // Close and unlink the old FIFO before the replacement creates a new
+        // one at the same path.
+        self.inner.prolink_monitor.take();
         let new = Self::spawn(new_config)?;
-        let new = std::mem::ManuallyDrop::new(new);
-        // SAFETY: `new` is wrapped in `ManuallyDrop`, so its destructor will
-        // not run when `new` goes out of scope at the end of this function.
-        // The three `ptr::read`s bitwise-move each field into `self`,
-        // overwriting `self`'s old fields whose destructors already ran via
-        // `self.stop()` above plus the `_emmc_lock = None` drop on line 265
-        // (i.e. self's own resources are already released).  After the
-        // moves, the source struct is logically uninitialised and
-        // `ManuallyDrop` prevents a double-drop on the moved-from fields.
-        unsafe {
-            self.inner = std::ptr::read(&new.inner);
-            self.config = std::ptr::read(&new.config);
-            self.running = std::ptr::read(&new.running);
-        }
+        // The old instance has already stopped and released its resources.
+        // Suppress its path cleanup because the replacement now owns fresh
+        // sockets and shared files under the same instance directory.
+        self.cleanup_on_drop = false;
+        let old = std::mem::replace(self, new);
+        drop(old);
         Ok(())
     }
 
@@ -301,7 +337,9 @@ impl Drop for QemuInstance {
         self.shutdown_sequence();
         self.inner.thread.take().and_then(|t| t.join().ok());
         QEMU_CHILD_PID.store(-1, Ordering::Relaxed);
-        cleanup_qemu_files_for_restart(&self.config.sock_dir());
+        if self.cleanup_on_drop {
+            cleanup_qemu_files_for_restart(&self.config.sock_dir());
+        }
     }
 }
 
@@ -482,13 +520,19 @@ mod prune_tests {
 
         prune_shared_dirs(&base, &net, std::process::id());
         assert!(!own.exists(), "own lease released");
-        assert!(sock.exists() && leases.exists() && net.exists(), "another live lease keeps the daemon");
+        assert!(
+            sock.exists() && leases.exists() && net.exists(),
+            "another live lease keeps the daemon"
+        );
         assert!(!base.exists(), "empty runtime base dir goes regardless");
 
         std::fs::remove_file(&other).unwrap();
         std::fs::create_dir_all(&base).unwrap();
         prune_shared_dirs(&base, &net, std::process::id());
-        assert!(!sock.exists() && !leases.exists() && !net.exists(), "last one out takes the DJPL tree");
+        assert!(
+            !sock.exists() && !leases.exists() && !net.exists(),
+            "last one out takes the DJPL tree"
+        );
         assert!(!base.exists());
         let _ = std::fs::remove_dir_all(&root);
     }

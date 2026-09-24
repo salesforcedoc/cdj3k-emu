@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use cdj3k_emu_platform::menu_state::GuestKeyboardInput;
+
 pub struct QmpClient {
     stream: TcpStream,
     reader: BufReader<TcpStream>,
@@ -92,6 +94,29 @@ impl QmpClient {
             }
             // Could be an event - skip and read next line.
         }
+    }
+
+    /// Press and release one key on QEMU's virtual keyboard.
+    ///
+    /// `send-key` deliberately queues a short delay between HID state changes;
+    /// sending down/up in a single `input-send-event` batch can collapse to an
+    /// unchanged final USB report before the guest observes the press.
+    pub fn send_guest_key(&mut self, input: GuestKeyboardInput) -> Result<(), QmpError> {
+        let Some((qcode, shifted)) = qcode_for_input(input) else {
+            return Ok(());
+        };
+        let keys = if shifted {
+            serde_json::json!([
+                { "type": "qcode", "data": "shift" },
+                { "type": "qcode", "data": qcode }
+            ])
+        } else {
+            serde_json::json!([{ "type": "qcode", "data": qcode }])
+        };
+        // Omitting hold-time uses QEMU's 10 ms default. The runtime worker
+        // paces calls so a press is fully observed before the next one queues.
+        self.execute("send-key", &serde_json::json!({ "keys": keys }))?;
+        Ok(())
     }
 
     /// Hot-add a raw block device file as a named blockdev node.
@@ -189,5 +214,130 @@ impl QmpClient {
         let mut line = String::new();
         self.reader.read_line(&mut line)?;
         Ok(line)
+    }
+}
+
+fn qcode_for_input(input: GuestKeyboardInput) -> Option<(&'static str, bool)> {
+    use GuestKeyboardInput::*;
+
+    let special = match input {
+        Backspace => Some(("backspace", false)),
+        Delete => Some(("delete", false)),
+        Enter => Some(("ret", false)),
+        Escape => Some(("esc", false)),
+        Tab => Some(("tab", false)),
+        Left => Some(("left", false)),
+        Right => Some(("right", false)),
+        Up => Some(("up", false)),
+        Down => Some(("down", false)),
+        Home => Some(("home", false)),
+        End => Some(("end", false)),
+        Text(_) => None,
+    };
+    if special.is_some() {
+        return special;
+    }
+
+    let Text(ch) = input else { unreachable!() };
+    Some(match ch {
+        'a'..='z' => (letter_qcode(ch), false),
+        'A'..='Z' => (letter_qcode(ch.to_ascii_lowercase()), true),
+        '0' => ("0", false),
+        '1' => ("1", false),
+        '2' => ("2", false),
+        '3' => ("3", false),
+        '4' => ("4", false),
+        '5' => ("5", false),
+        '6' => ("6", false),
+        '7' => ("7", false),
+        '8' => ("8", false),
+        '9' => ("9", false),
+        ' ' => ("spc", false),
+        '-' => ("minus", false),
+        '_' => ("minus", true),
+        '=' => ("equal", false),
+        '+' => ("equal", true),
+        '[' => ("bracket_left", false),
+        '{' => ("bracket_left", true),
+        ']' => ("bracket_right", false),
+        '}' => ("bracket_right", true),
+        '\\' => ("backslash", false),
+        '|' => ("backslash", true),
+        ';' => ("semicolon", false),
+        ':' => ("semicolon", true),
+        '\'' => ("apostrophe", false),
+        '"' => ("apostrophe", true),
+        '`' => ("grave_accent", false),
+        '~' => ("grave_accent", true),
+        ',' => ("comma", false),
+        '<' => ("comma", true),
+        '.' => ("dot", false),
+        '>' => ("dot", true),
+        '/' => ("slash", false),
+        '?' => ("slash", true),
+        '!' => ("1", true),
+        '@' => ("2", true),
+        '#' => ("3", true),
+        '$' => ("4", true),
+        '%' => ("5", true),
+        '^' => ("6", true),
+        '&' => ("7", true),
+        '*' => ("8", true),
+        '(' => ("9", true),
+        ')' => ("0", true),
+        _ => return None,
+    })
+}
+
+fn letter_qcode(ch: char) -> &'static str {
+    match ch {
+        'a' => "a",
+        'b' => "b",
+        'c' => "c",
+        'd' => "d",
+        'e' => "e",
+        'f' => "f",
+        'g' => "g",
+        'h' => "h",
+        'i' => "i",
+        'j' => "j",
+        'k' => "k",
+        'l' => "l",
+        'm' => "m",
+        'n' => "n",
+        'o' => "o",
+        'p' => "p",
+        'q' => "q",
+        'r' => "r",
+        's' => "s",
+        't' => "t",
+        'u' => "u",
+        'v' => "v",
+        'w' => "w",
+        'x' => "x",
+        'y' => "y",
+        'z' => "z",
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::*;
+
+    #[test]
+    fn every_printable_ascii_character_has_a_qcode() {
+        for byte in b' '..=b'~' {
+            assert!(
+                qcode_for_input(GuestKeyboardInput::Text(byte as char)).is_some(),
+                "missing ASCII mapping for {:?}",
+                byte as char
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_unicode_is_ignored() {
+        assert_eq!(qcode_for_input(GuestKeyboardInput::Text('é')), None);
     }
 }

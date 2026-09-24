@@ -57,8 +57,8 @@ do with real CDJs on a physical LAN when you're on vacation.
 >   faithful enough to drive EP122 (the stock firmware), but the goal is a
 >   daily-driver emulator, not a forensic recreation.
 > - Not a turntable replacement. Jog wheel and rotary feel are reproduced via
->   pointer drag + scroll wheel; there's no support for an external MIDI
->   controller bridging into the emulated SPI bus.
+>   pointer drag + scroll wheel or MIDI jog input. MIDI input covers selected
+>   performance controls rather than the full control surface.
 > - Not currently portable. Apple Silicon macOS only (HVF, vmnet.framework,
 >   AppKit window/menu, CoreAudio). Linux/Windows are out of scope for v0.1.
 > - **Not compatible with pre-3.00 firmware.** See _Firmware compatibility_
@@ -132,6 +132,14 @@ user's responsibility, by whatever means they are themselves entitled to.
   end-to-end with the bundled bypass-ring patches. ALC ("Enable ALC") shifts
   the audible / Pro DJ Link broadcast alignment to compensate but adds a
   bit of jitter; default-on.
+- If an output device stalls or is reconnected, use **Audio → Reset Audio**
+  in that player's window. This closes and reopens its CoreAudio path without
+  restarting the emulator or guest firmware.
+- Use **Audio → Latency Profile…** to select a per-player Safe, Balanced, Low
+  Latency, or Custom buffer profile. Balanced retains the proven 2,048-frame
+  startup prefill and 1,024-frame guest transfer size. Profile changes restart
+  only that player because the guest transfer size is negotiated when ALSA
+  opens the stream.
 - Jog wheel feel is "good enough for cueing" — no torque feedback.
   Brake stop-time map matches the device's `jog_adjust` rotary, so
   the _cadence_ of stops is faithful even if the touch isn't.
@@ -163,6 +171,108 @@ On a real CDJ, you can hold a button or touch the screen while doing something e
 
 This lets you, for example, keep `Search Forward` held down while moving the jog wheel to search faster, just like on real hardware.
 
+### Firmware keyboard input
+
+When the firmware shows its on-screen keyboard, click the player window and
+type on the Mac keyboard. Printable US-ASCII characters, Backspace, Delete,
+Enter, Escape, Tab, the arrow keys, Home, and End are forwarded to the
+firmware's focused text field. Clipboard paste is supported for US-ASCII text.
+The guest sees a standard USB keyboard; the firmware's own keyboard focus
+determines whether the input is accepted, so there is no screen-image matching
+or firmware-version-specific coordinate map.
+
+### Virtual mixer
+
+Open **View → Virtual Mixer** from any player window for a shared four-channel,
+DJM-A9-style mixer. Players 1-4 are routed to channel strips 1-4 respectively.
+Each strip has trim, high/mid/low EQ, a low-pass/high-pass
+filter, a channel fader, a pre-fader meter, and an A/THRU/B crossfader assignment.
+THRU bypasses the crossfader. The master strip to the right of channel 4 has
+stereo output meters, a global EQ/ISO curve switch, a master level knob (0 dB at
+12 o'clock), and Echo, Reverb, Flanger, and Delay effects. CH SELECT targets
+channels 1–4 or the master mix. FX FREQUENCY's LOW/MID/HI buttons select which
+input bands feed the effect; LEVEL/DEPTH controls the wet amount. FX ON/OFF
+applies the effect only while enabled; switching it off fades the wet signal
+out briefly while the dry track continues. The A and B
+headphone CUE buttons on each channel and Master toggle independent cue buses.
+Choose **Audio → Cue A Output** and **Audio → Cue B Output** to route them to
+host output devices; both are off until assigned. Channel cues tap post-EQ and
+filter but pre-fader/crossfader, while Master cue taps the master mix before the
+master level knob. QEMU publishes
+each player's raw audio to a shared lock-free
+ring. One singleton native mixer owns CoreAudio, applies all four channel
+strips, and performs the final sum through the Master output, with separate
+native streams for the enabled cue buses. Mixer
+positions are persisted independently for each player.
+
+Drag a knob vertically; double-click it to return to the center/default value.
+All four channels' trim, EQ, filter, fader, and crossfader assignment controls,
+plus the global EQ/ISO curve, appear on the Mixer tab
+of the shared MIDI Learn window. Continuous controls learn CC messages;
+switches learn Notes or CCs. They intentionally have
+no factory MIDI CC numbers, since mixer controller layouts vary.
+The master level and FX controls can also be learned there.
+
+### MIDI controllers
+
+The app automatically connects to available CoreMIDI inputs and checks for
+hot-plugged controllers twice per second. Endpoints are tracked by CoreMIDI's
+stable ID, so adding or removing one controller does not interrupt the others.
+MIDI Learn is one shared window with **Slot 1–4** and **Mixer** tabs. Open
+**Emulation → MIDI Learn…** from any player, select a tab, click **Learn** beside
+a control, then operate the desired controller button, jog, or fader. Deck
+assignments are stored separately for each slot; mixer assignments are shared.
+A learned binding is matched by CoreMIDI port, MIDI channel, and Note or CC
+number, so multiple player windows do not cross-trigger.
+
+If a controller was reconnected under the same endpoint ID but its driver left
+a stale connection, click **Rescan MIDI Devices**. Replacements are opened
+before healthy old handles are dropped whenever the driver permits it, avoiding
+an input blackout. The profile bar can save, load, overwrite,
+and delete named assignment sets. Each slot and the mixer have separate
+profiles. Rescan and Reset apply to MIDI inputs in all running player instances.
+
+Fresh slots use the official CDJ-3000 messages below. Player 1 defaults to MIDI
+channel 1, Player 2 to channel 2, and so on:
+
+| Control | MIDI message |
+| --- | --- |
+| Play/Pause | Note 0 (`0x00`) |
+| Cue | Note 1 (`0x01`) |
+| Hot Cues A-H | Notes 27-34 (`0x1B`-`0x22`) |
+| Pitch/tempo fader | CC 29 (`0x1D`), values 0-127 |
+| Hot Cue Call/Delete | Note 26 (`0x1A`) |
+| Loop In / Out | Notes 35 / 36 (`0x23` / `0x24`) |
+| Reloop/Exit | Note 37 (`0x25`) |
+| Beat Sync | Note 22 (`0x16`) |
+| Master Tempo | Note 11 (`0x0B`) |
+| Tempo Range / Reset | Notes 10 / 9 (`0x0A` / `0x09`) |
+| Jog platter / outer ring | CC 16 / 48 (`0x10` / `0x30`), 64 = stop |
+| Jog touch | Note 23 (`0x17`) |
+| Mixer trim / high / mid / low / filter / fader | Unassigned; learn any CC |
+
+The Slot tabs also expose the remaining physical switch-frame buttons,
+including search and track navigation, beat jump, loop, memory/call/delete,
+source and browse controls, quantize, slip, reverse, and utility buttons.
+Where the [CDJ-3000 MIDI message list](https://downloads.support.alphatheta.com/software_info/dj-players/CDJ-3000/CDJ3000_MIDI_Message_List_E108.pdf)
+publishes a Note number, it is the default; other controls start unassigned.
+
+Button velocity zero and Note Off both release a button. Tempo value 64 maps
+to the center detent. Button assignments can learn either Notes or CCs; the
+pitch/tempo, jog-motion, and mixer assignments learn CCs. Jog platter and outer
+ring use the CDJ-3000's speed-centred CC format by default. For controllers
+that send relative jog increments (1 forward, 127 backward), select
+**Relative (1 / 127)** beside the jog assignment. The adjacent **Steps/rev**
+field sets how many relative encoder counts equal one full turn, separately
+for the platter and outer ring (default 128); it is saved with each slot's
+MIDI profile. The separate Jog Touch assignment
+enables vinyl/scratch touch semantics while held; outer-ring motion provides
+pitch bending without touch. Reloop and Exit share the same physical control,
+so there is one MIDI assignment for both. The MIDI Learn window can also clear
+an individual binding or restore that player's defaults. Devices that emit the
+[CDJ-3000 MIDI assignments](https://www.pioneerdj.com/-/media/pioneerdj/software-info/player/cdj-3000/cdj3000_midi_message_list_e108.pdf)
+work without remapping when their MIDI channel matches the player slot.
+
 ## EP122 mods
 
 The LD_PRELOAD shim also carries the [cdj3k-mods](https://github.com/nsaintot/cdj3k-mods)
@@ -190,7 +300,9 @@ git clone --recurse-submodules https://github.com/nsaintot/cdj3k-emu
 ./qemu/build.sh
 
 # 2. Build the aarch64 kernel, out-of-tree modules, shim + mods, and guest
-#    tools (Docker). `make abi-check` gates the shim against the deck's glibc.
+#    tools (Docker). No Pioneer firmware is needed at compile time; the app's
+#    first-run wizard extracts and patches the user-supplied firmware.
+#    `make abi-check` gates the shim against the deck's glibc.
 ./build.sh
 
 # 3. Assemble the .app bundle. The Homebrew dylibs QEMU links against are

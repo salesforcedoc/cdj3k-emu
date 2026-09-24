@@ -1,0 +1,76 @@
+diff --git a/net/dump.c b/net/dump.c
+index 0c39f09..226e36e 100644
+--- a/net/dump.c
++++ b/net/dump.c
+@@ -38,6 +38,7 @@ typedef struct DumpState {
+     int64_t start_ts;
+     int fd;
+     int pcap_caplen;
++    bool drop_on_backpressure;
+ } DumpState;
+ 
+ #define PCAP_MAGIC 0xa1b2c3d4
+@@ -87,7 +88,22 @@ static ssize_t dump_receive_iov(DumpState *s, const struct iovec *iov, int cnt,
+     dumpiov[0].iov_len = sizeof(hdr);
+     cnt = iov_copy(&dumpiov[1], cnt, iov, cnt, offset, caplen);
+ 
+-    if (writev(s->fd, dumpiov, cnt + 1) != sizeof(hdr) + caplen) {
++    ssize_t written;
++    do {
++        written = writev(s->fd, dumpiov, cnt + 1);
++    } while (written < 0 && errno == EINTR);
++
++    /* A FIFO used for passive monitoring must never apply backpressure to
++     * the emulated network. In particular, a burst of Pro DJ Link track data
++     * can otherwise block QEMU's main loop here long enough to starve an
++     * unrelated realtime audio stream. Dropping an optional capture record
++     * is preferable to delaying the packet being mirrored. */
++    if (written < 0 && s->drop_on_backpressure &&
++        (errno == EAGAIN || errno == EWOULDBLOCK)) {
++        return size;
++    }
++
++    if (written != (ssize_t)(sizeof(hdr) + caplen)) {
+         error_report("network dump write error - stopping dump");
+         close(s->fd);
+         s->fd = -1;
+@@ -108,13 +124,38 @@ static int net_dump_state_init(DumpState *s, const char *filename,
+     struct pcap_file_hdr hdr;
+     struct tm tm;
+     int fd;
++    int open_flags = O_CREAT | O_TRUNC | O_WRONLY | O_BINARY;
++
++    s->drop_on_backpressure = false;
+ 
+-    fd = open(filename, O_CREAT | O_TRUNC | O_WRONLY | O_BINARY, 0644);
++#ifndef _WIN32
++    struct stat st;
++    if (stat(filename, &st) == 0 && S_ISFIFO(st.st_mode)) {
++        /* filter-dump is normally lossless, but a diagnostic FIFO must be a
++         * lossy observer: its reader is not part of the network datapath. */
++        open_flags |= O_NONBLOCK;
++        s->drop_on_backpressure = true;
++    }
++#endif
++
++    fd = open(filename, open_flags, 0644);
+     if (fd < 0) {
+         error_setg_file_open(errp, errno, filename);
+         return -1;
+     }
+ 
++#ifndef _WIN32
++    if (s->drop_on_backpressure) {
++        /* Keep each pcap record within PIPE_BUF so a nonblocking write is
++         * atomic: it is either accepted whole or rejected with EAGAIN. */
++        long pipe_buf = fpathconf(fd, _PC_PIPE_BUF);
++        long header_size = sizeof(struct pcap_sf_pkthdr);
++        if (pipe_buf > header_size && (long)len > pipe_buf - header_size) {
++            len = (int)(pipe_buf - header_size);
++        }
++    }
++#endif
++
+     hdr.magic = PCAP_MAGIC;
+     hdr.version_major = 2;
+     hdr.version_minor = 4;

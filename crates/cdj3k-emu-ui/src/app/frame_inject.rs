@@ -40,6 +40,9 @@ impl CdjApp {
         for &btn in &self.latched_btns {
             f.set_btn(btn, true);
         }
+        for held in self.midi_held_btns.values() {
+            f.set_btn(held.button, true);
+        }
         f.set_direction(self.direction);
         f.set_jog(self.jog_pos, self.jog_vel, self.jog_touch);
         f.set_rotary(self.rotary);

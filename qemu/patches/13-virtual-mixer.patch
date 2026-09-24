@@ -1,0 +1,356 @@
+diff --git a/audio/coreaudio.m b/audio/coreaudio.m
+--- a/audio/coreaudio.m
++++ b/audio/coreaudio.m
+@@ -27,6 +27,9 @@
+ #include <mach/mach_time.h>      /* mach_absolute_time, mach_timebase_info */
+ #include <pthread.h>            /* pthread_X */
+ #include <stdatomic.h>           /* _Atomic */
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
+ 
+ #include "qemu/main-loop.h"
+ #include "qemu/module.h"
+@@ -42,6 +45,23 @@
+     AudioMixengBackend parent_obj;
+ };
+ 
++#define CDJ3K_MIXER_MAGIC 0x31584d43u /* "CMX1" little-endian */
++#define CDJ3K_MIXER_VERSION 1u
++#define CDJ3K_MIXER_CHANNELS 4u
++#define CDJ3K_MIXER_HEADER_BYTES 64u
++#define CDJ3K_MIXER_CHANNEL_BYTES 64u
++#define CDJ3K_MIXER_BYTES (CDJ3K_MIXER_HEADER_BYTES + \
++                           CDJ3K_MIXER_CHANNELS * CDJ3K_MIXER_CHANNEL_BYTES)
++
++typedef struct Cdj3kMixerChannel {
++    _Atomic uint32_t control[6]; /* trim, high, mid, low, filter, fader */
++    _Atomic uint32_t peak[2];
++    _Atomic uint32_t reserved[8];
++} Cdj3kMixerChannel;
++
++_Static_assert(sizeof(Cdj3kMixerChannel) == CDJ3K_MIXER_CHANNEL_BYTES,
++               "virtual mixer channel layout must match Rust");
++
+ typedef struct coreaudioVoiceOut {
+     HWVoiceOut hw;
+     pthread_mutex_t buf_mutex;
+@@ -51,6 +71,19 @@
+     UInt32 device_frame_size;
+     AudioDeviceIOProcID ioprocid;
+     bool enabled;
++    void *mixer_map;
++    size_t mixer_map_size;
++    Cdj3kMixerChannel *mixer_channel;
++    float mixer_low_state[2];
++    float mixer_high_state[2];
++    float mixer_filter_state[2];
++    float mixer_trim_gain;
++    float mixer_high_gain;
++    float mixer_mid_gain;
++    float mixer_low_gain;
++    float mixer_fader_gain;
++    float mixer_filter_alpha;
++    int mixer_filter_mode;
+ } CoreaudioVoiceOut;
+ 
+ /* AudioDeviceID currently bound by init_out_device. Used by the HAL
+@@ -442,6 +475,212 @@
+ COREAUDIO_WRAPPER_FUNC(write, size_t, (HWVoiceOut *hw, void *buf, size_t size),
+                        (hw, buf, size))
+ #undef COREAUDIO_WRAPPER_FUNC
++
++static float cdj3k_mixer_norm(_Atomic uint32_t *value)
++{
++    uint32_t raw = atomic_load_explicit(value, memory_order_relaxed);
++    return MIN(raw, 1000u) / 1000.0f;
++}
++
++static float cdj3k_mixer_eq_gain(float value)
++{
++    float db = value <= 0.5f
++        ? -26.0f + value * 52.0f
++        : (value - 0.5f) * 12.0f;
++    return powf(10.0f, db / 20.0f);
++}
++
++static float cdj3k_mixer_alpha(float cutoff, float sample_rate)
++{
++    if (sample_rate <= 0.0f) {
++        return 1.0f;
++    }
++    return 1.0f - expf(-2.0f * (float)M_PI * cutoff / sample_rate);
++}
++
++static void cdj3k_mixer_publish_silence(CoreaudioVoiceOut *core)
++{
++    if (!core->mixer_channel) {
++        return;
++    }
++    atomic_store_explicit(&core->mixer_channel->peak[0], 0,
++                          memory_order_relaxed);
++    atomic_store_explicit(&core->mixer_channel->peak[1], 0,
++                          memory_order_relaxed);
++}
++
++/* Apply the current channel strip directly to QEMU's float32 interleaved
++ * output. CoreAudio then sums the independently-running player processes on
++ * their common output device, producing the virtual four-channel mixer. */
++static void cdj3k_mixer_process(CoreaudioVoiceOut *core, void *buffer,
++                                UInt32 frames)
++{
++    Cdj3kMixerChannel *channel = core->mixer_channel;
++    unsigned channels = core->hw.info.nchannels;
++    float sample_rate = core->hw.info.freq;
++    float *samples = buffer;
++    float peak[2] = { 0.0f, 0.0f };
++
++    if (!channel || !buffer || !frames || !channels) {
++        return;
++    }
++
++    float trim = cdj3k_mixer_norm(&channel->control[0]);
++    float high = cdj3k_mixer_norm(&channel->control[1]);
++    float mid = cdj3k_mixer_norm(&channel->control[2]);
++    float low = cdj3k_mixer_norm(&channel->control[3]);
++    float filter = cdj3k_mixer_norm(&channel->control[4]);
++    float fader = cdj3k_mixer_norm(&channel->control[5]);
++    float target_trim = powf(10.0f, ((trim - 0.5f) * 24.0f) / 20.0f);
++    float target_high = cdj3k_mixer_eq_gain(high);
++    float target_mid = cdj3k_mixer_eq_gain(mid);
++    float target_low = cdj3k_mixer_eq_gain(low);
++    float target_fader = fader * fader * fader;
++    float target_filter_alpha = core->mixer_filter_alpha;
++    int target_filter_mode = 0;
++
++    if (filter < 0.48f) {
++        float position = filter / 0.48f;
++        float cutoff = 80.0f * powf(18000.0f / 80.0f, position);
++        target_filter_alpha = cdj3k_mixer_alpha(cutoff, sample_rate);
++        target_filter_mode = -1; /* low-pass */
++    } else if (filter > 0.52f) {
++        float position = (filter - 0.52f) / 0.48f;
++        float cutoff = 20.0f * powf(10000.0f / 20.0f, position);
++        target_filter_alpha = cdj3k_mixer_alpha(cutoff, sample_rate);
++        target_filter_mode = 1; /* high-pass */
++    }
++
++    float inv_frames = 1.0f / frames;
++    float trim_step = (target_trim - core->mixer_trim_gain) * inv_frames;
++    float high_step = (target_high - core->mixer_high_gain) * inv_frames;
++    float mid_step = (target_mid - core->mixer_mid_gain) * inv_frames;
++    float low_step = (target_low - core->mixer_low_gain) * inv_frames;
++    float fader_step = (target_fader - core->mixer_fader_gain) * inv_frames;
++    float filter_step = (target_filter_alpha - core->mixer_filter_alpha)
++                        * inv_frames;
++    float low_alpha = cdj3k_mixer_alpha(250.0f, sample_rate);
++    float high_alpha = cdj3k_mixer_alpha(4000.0f, sample_rate);
++
++    core->mixer_filter_mode = target_filter_mode;
++    for (UInt32 frame = 0; frame < frames; frame++) {
++        core->mixer_trim_gain += trim_step;
++        core->mixer_high_gain += high_step;
++        core->mixer_mid_gain += mid_step;
++        core->mixer_low_gain += low_step;
++        core->mixer_fader_gain += fader_step;
++        core->mixer_filter_alpha += filter_step;
++
++        for (unsigned stream = 0; stream < channels; stream++) {
++            unsigned state = MIN(stream, 1u);
++            size_t index = (size_t)frame * channels + stream;
++            float input = samples[index];
++
++            core->mixer_low_state[state] += low_alpha
++                * (input - core->mixer_low_state[state]);
++            core->mixer_high_state[state] += high_alpha
++                * (input - core->mixer_high_state[state]);
++            float low_band = core->mixer_low_state[state];
++            float mid_band = core->mixer_high_state[state] - low_band;
++            float high_band = input - core->mixer_high_state[state];
++            float output = low_band * core->mixer_low_gain
++                         + mid_band * core->mixer_mid_gain
++                         + high_band * core->mixer_high_gain;
++            output *= core->mixer_trim_gain;
++
++            if (core->mixer_filter_mode == 0) {
++                core->mixer_filter_state[state] = output;
++            } else {
++                core->mixer_filter_state[state] += core->mixer_filter_alpha
++                    * (output - core->mixer_filter_state[state]);
++                output = core->mixer_filter_mode < 0
++                    ? core->mixer_filter_state[state]
++                    : output - core->mixer_filter_state[state];
++            }
++            output *= core->mixer_fader_gain;
++            output = MAX(-1.0f, MIN(1.0f, output));
++            samples[index] = output;
++            peak[state] = MAX(peak[state], fabsf(output));
++        }
++    }
++
++    core->mixer_trim_gain = target_trim;
++    core->mixer_high_gain = target_high;
++    core->mixer_mid_gain = target_mid;
++    core->mixer_low_gain = target_low;
++    core->mixer_fader_gain = target_fader;
++    core->mixer_filter_alpha = target_filter_alpha;
++    if (channels == 1) {
++        peak[1] = peak[0];
++    }
++    atomic_store_explicit(&channel->peak[0],
++                          (uint32_t)(MIN(peak[0], 1.0f) * 1000.0f),
++                          memory_order_relaxed);
++    atomic_store_explicit(&channel->peak[1],
++                          (uint32_t)(MIN(peak[1], 1.0f) * 1000.0f),
++                          memory_order_relaxed);
++}
++
++static void cdj3k_mixer_init(CoreaudioVoiceOut *core)
++{
++    const char *path = getenv("CDJ3K_EMU_MIXER_SHM");
++    const char *channel_env = getenv("CDJ3K_EMU_MIXER_CHANNEL");
++    char *end = NULL;
++    long channel_index = channel_env ? strtol(channel_env, &end, 10) : -1;
++
++    core->mixer_trim_gain = 1.0f;
++    core->mixer_high_gain = 1.0f;
++    core->mixer_mid_gain = 1.0f;
++    core->mixer_low_gain = 1.0f;
++    core->mixer_fader_gain = 1.0f;
++    core->mixer_filter_alpha = 1.0f;
++    if (!path || !path[0] || channel_index < 0
++        || channel_index >= CDJ3K_MIXER_CHANNELS
++        || (end && *end != '\0')) {
++        return;
++    }
++
++    int fd = open(path, O_RDWR);
++    if (fd < 0) {
++        error_report("coreaudio: could not open virtual mixer %s: %s",
++                     path, strerror(errno));
++        return;
++    }
++    void *mapping = mmap(NULL, CDJ3K_MIXER_BYTES, PROT_READ | PROT_WRITE,
++                         MAP_SHARED, fd, 0);
++    close(fd);
++    if (mapping == MAP_FAILED) {
++        error_report("coreaudio: could not map virtual mixer %s: %s",
++                     path, strerror(errno));
++        return;
++    }
++
++    _Atomic uint32_t *header = mapping;
++    if (atomic_load_explicit(&header[0], memory_order_acquire)
++            != CDJ3K_MIXER_MAGIC
++        || atomic_load_explicit(&header[1], memory_order_relaxed)
++            != CDJ3K_MIXER_VERSION) {
++        error_report("coreaudio: virtual mixer has an incompatible layout");
++        munmap(mapping, CDJ3K_MIXER_BYTES);
++        return;
++    }
++    core->mixer_map = mapping;
++    core->mixer_map_size = CDJ3K_MIXER_BYTES;
++    core->mixer_channel = (Cdj3kMixerChannel *)
++        ((uint8_t *)mapping + CDJ3K_MIXER_HEADER_BYTES
++         + channel_index * CDJ3K_MIXER_CHANNEL_BYTES);
++}
++
++static void cdj3k_mixer_fini(CoreaudioVoiceOut *core)
++{
++    cdj3k_mixer_publish_silence(core);
++    core->mixer_channel = NULL;
++    if (core->mixer_map) {
++        munmap(core->mixer_map, core->mixer_map_size);
++        core->mixer_map = NULL;
++        core->mixer_map_size = 0;
++    }
++}
+ 
+ /*
+  * callback to feed audiooutput buffer. called without BQL.
+@@ -458,6 +697,7 @@
+ {
+     UInt32 frame_size, pending_frames;
+     void *out = outOutputData->mBuffers[0].mData;
++    void *out_start = out;
+     HWVoiceOut *hw = hwptr;
+     CoreaudioVoiceOut *core = hwptr;
+     size_t len;
+@@ -504,12 +744,14 @@
+             /* Ring underrun: emit silence (still better than stale data).
+              * Record so the periodic logger sees real ring-empty events. */
+             memset(out, 0, len);
++            cdj3k_mixer_publish_silence(core);
+             if (&virtio_snd_bypass_note_underrun) {
+                 virtio_snd_bypass_note_underrun(frame_size);
+             }
+             return 0;
+         }
+         virtio_snd_bypass_read(out, len);
++        cdj3k_mixer_process(core, out, frame_size);
+         return 0;
+     }
+ 
+@@ -530,11 +772,13 @@
+     if (coreaudio_voice_out_buf_lock(core, "out_device_ioproc")) {
+         inInputTime = 0;
+         memset(out, 0, len);
++        cdj3k_mixer_publish_silence(core);
+         return 0;
+     }
+ 
+     if (inDevice != core->device_id) {
+         memset(out, 0, len);
++        cdj3k_mixer_publish_silence(core);
+         coreaudio_voice_out_buf_unlock(core, "out_device_ioproc(old device)");
+         return 0;
+     }
+@@ -557,6 +801,7 @@
+     if (pending_frames < frame_size) {
+         inInputTime = 0;
+         memset(out, 0, len);
++        cdj3k_mixer_publish_silence(core);
+         coreaudio_voice_out_buf_unlock(core, "out_device_ioproc(empty)");
+         return 0;
+     }
+@@ -576,6 +821,7 @@
+         out += write_len;
+     }
+ 
++    cdj3k_mixer_process(core, out_start, frame_size);
+     coreaudio_voice_out_buf_unlock(core, "out_device_ioproc");
+     return 0;
+ }
+@@ -975,6 +1221,7 @@
+     as = &obt_as;
+     as->fmt = AUDIO_FORMAT_F32;
+     audio_pcm_init_info(&hw->info, as);
++    cdj3k_mixer_init(core);
+ 
+     core->frame_size_setting = audio_buffer_frames(
+         qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
+@@ -999,6 +1246,7 @@
+     if (status != kAudioHardwareNoError) {
+         coreaudio_playback_logerr(status,
+                                   "Could not listen to voice property change");
++        cdj3k_mixer_fini(core);
+         return -1;
+     }
+ 
+@@ -1011,7 +1259,7 @@
+             coreaudio_playback_logerr(status,
+                                       "Could not remove voice property change listener");
+         }
+-
++        cdj3k_mixer_fini(core);
+         return -1;
+     }
+ 
+@@ -1033,6 +1281,7 @@
+     }
+ 
+     fini_out_device(core);
++    cdj3k_mixer_fini(core);
+ 
+     /* destroy mutex */
+     err = pthread_mutex_destroy(&core->buf_mutex);

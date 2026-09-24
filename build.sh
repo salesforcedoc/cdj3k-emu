@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # build.sh
 #
-# Build all guest artifacts (Linux 6.6 LTS kernel + out-of-tree modules + tools),
-# install them into the Pioneer rootfs, apply patches, and repack the initramfs.
+# Build all guest artifacts (Linux 6.6 LTS kernel + out-of-tree modules + tools).
+# When a development initramfs is present, also install the artifacts into it,
+# apply patches, and repack it.  The app bundle does not require this optional
+# step: its firmware wizard patches the user-supplied rootfs at install time.
 # Run this whenever you change a module, patch script, or kernel config.
 #
 # Artifacts built (see docker/Dockerfile):
@@ -17,13 +19,27 @@
 #
 # Outputs:
 #   build/Image
-#   build/initramfs-patched.cpio.gz
+#   build/docker-out/modules/*.ko
+#   guest/out/*
+#   build/initramfs-patched.cpio.gz  (only when a source initramfs is present)
 #
 # Prerequisites:
 #   docker with BuildKit support (Docker Desktop / OrbStack)
 
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+
+# Homebrew's Docker CLI can use Docker Desktop's daemon while omitting the
+# app's helper binaries from PATH.  If ~/.docker/config.json names the
+# "desktop" credential store, registry pulls then fail before the build starts
+# even though Docker Desktop and its helper are installed.  Make the standard
+# app-bundle helper location available locally without changing the user's
+# shell or Docker configuration.
+DOCKER_DESKTOP_BIN="/Applications/Docker.app/Contents/Resources/bin"
+if ! command -v docker-credential-desktop >/dev/null 2>&1 \
+    && [[ -x "$DOCKER_DESKTOP_BIN/docker-credential-desktop" ]]; then
+    export PATH="$DOCKER_DESKTOP_BIN:$PATH"
+fi
 
 CLEAN_AFTER_BUILD=0
 # SSH access (dropbear on port 2222) is dev-only.  Off by default for shipping
@@ -80,12 +96,6 @@ echo "  CDJ-3000 build (Linux 6.6 LTS)"
 echo "================================================================"
 echo ""
 
-# Ensure Pioneer rootfs source exists
-if [[ ! -f "$INITRAMFS_ORIG" ]]; then
-    echo "ERROR: source initramfs not found: $INITRAMFS_ORIG" >&2
-    exit 1
-fi
-
 # [1/5] Build kernel + modules + tools via Docker
 echo "[1/5] Building artifacts (docker/Dockerfile - target artifacts)..."
 rm -rf "$DOCKER_OUT"
@@ -107,6 +117,34 @@ echo ""
 # Copy kernel image to canonical path
 cp "$DOCKER_OUT/Image" "$REPO_ROOT/build/Image"
 echo "  ✓  Image → build/Image"
+
+# Save tools for bundle.sh.  These are build products and do not depend on a
+# Pioneer rootfs; the app's firmware wizard installs them into the rootfs at
+# first launch.
+mkdir -p "$REPO_ROOT/guest/out"
+for bin in ep122_shim.so subucom_forwarder_aarch64 subucom_live_aarch64 cfgd_aarch64 \
+           stemd_client_aarch64; do
+    cp "$DOCKER_OUT/$bin" "$REPO_ROOT/guest/out/$bin"
+done
+echo "  ✓  guest tools → guest/out/"
+echo ""
+
+# A source initramfs is optional for normal app builds.  It is useful only for
+# the legacy developer workflow that produces a pre-patched standalone image;
+# distributed app bundles patch the user's firmware at install time instead.
+if [[ ! -f "$INITRAMFS_ORIG" ]]; then
+    echo "Source initramfs not found; skipping optional development rootfs repack."
+    echo "The app's Install Firmware wizard will extract and patch the user-supplied firmware."
+    echo ""
+    echo "================================================================"
+    echo "  Build complete (bundle assets)."
+    echo ""
+    echo "  Kernel:    build/Image"
+    echo "  Modules:   build/docker-out/modules/"
+    echo "  Tools:     guest/out/"
+    echo "================================================================"
+    exit 0
+fi
 
 # [2/5] Restore Pioneer rootfs
 echo "[2/5] Restoring rootfs from: $INITRAMFS_ORIG"
@@ -152,16 +190,6 @@ chmod 755 "$ROOTFS_DIR/usr/bin/stemd_client"
 mkdir -p "$ROOTFS_DIR/home/root"
 cp "$DOCKER_OUT/ep122_shim.so" "$ROOTFS_DIR/home/root/ep122_shim.so"
 chmod 755 "$ROOTFS_DIR/home/root/ep122_shim.so"
-
-# Save tools to guest/out/ for bundle.sh
-mkdir -p "$REPO_ROOT/guest/out"
-# Every one of these is required: bundle.sh refuses a bundle without cfgd,
-# and the patch scripts abort the rootfs provision when a tool they install
-# is missing - long after a silently incomplete build looked fine here.
-for bin in ep122_shim.so subucom_forwarder_aarch64 subucom_live_aarch64 cfgd_aarch64 \
-           stemd_client_aarch64; do
-    cp "$DOCKER_OUT/$bin" "$REPO_ROOT/guest/out/$bin"
-done
 
 USB_IMG_SRC="$REPO_ROOT/build/usb.img"
 if [[ -f "$USB_IMG_SRC" ]]; then

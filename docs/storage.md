@@ -218,7 +218,7 @@ side-build does not drop newer fields.
 |---|---|---|---|
 | `mac` | `xx:xx:xx:xx:xx:xx` | generated LAA | First byte forced to `02` (LAA unicast). Generated on first load if absent or invalid. |
 | `audio_enabled` | `0` / `1` | `0` | Gates `virtio-snd` in argv |
-| `audio_device_uid` | CoreAudio UID or empty | empty | Output device for `-audiodev coreaudio,out.device-uid=...` |
+| `audio_device_uid` | CoreAudio UID or empty | empty | Application-wide native mixer output device |
 | `alc_enabled` | `0` / `1` | `1` | Pushes `audio_sync_enabled` to guest sysfs at boot |
 | `haptic_enabled` | `0` / `1` | `1` | Gates Force Touch detent clicks |
 | `net_iface` | `en0` etc. or empty | empty | Selected Pro DJ Link interface |

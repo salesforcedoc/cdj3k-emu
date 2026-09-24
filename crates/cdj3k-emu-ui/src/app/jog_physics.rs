@@ -113,6 +113,8 @@ impl CdjApp {
         let dragging = self.jog_drag_prev_angle.is_some();
         self.jog_scroll_hold_sec = (self.jog_scroll_hold_sec - dt).max(0.0);
         let scroll_active = self.jog_scroll_hold_sec > 0.0;
+        self.midi_jog_motion_hold_sec = (self.midi_jog_motion_hold_sec - dt).max(0.0);
+        let midi_motion_active = self.midi_jog_motion_hold_sec > 0.0;
         if !dragging && !scroll_active {
             // Clear transient mode once the scroll/drag session is fully over.
             self.jog_grip_drag = false;
@@ -124,7 +126,9 @@ impl CdjApp {
         let release_pulse = self.jog_release_touch_pulse_remaining_sec > 0.0;
         self.jog_release_touch_pulse_remaining_sec =
             (self.jog_release_touch_pulse_remaining_sec - dt).max(0.0);
-        let touch_active = ((dragging || scroll_active) && !grip) || release_pulse;
+        let touch_active = ((dragging || scroll_active) && !grip)
+            || !self.midi_jog_touch_held.is_empty()
+            || release_pulse;
 
         // Interpolate brake from the 13 jog_adjust detent positions.
         let adj_f = self.jog_adjust * (JOG_BRAKE_STOP_TIMES_SEC.len() - 1) as f32;
@@ -139,7 +143,7 @@ impl CdjApp {
         let dec = brake * dt.max(DT_FLOOR);
 
         if self.jog_omega != 0.0 {
-            if !dragging && !scroll_active {
+            if !dragging && !scroll_active && !midi_motion_active {
                 // Free coast only: integrate omega into position. During
                 // active drag/scroll, jog_apply_delta already moves jog_angle
                 // directly; integrating omega here too would double-count.
@@ -365,6 +369,19 @@ impl CdjApp {
         self.jog_grip_drag = grip;
         self.jog_scroll_hold_sec = JOG_SCROLL_HOLD_SEC;
         self.jog_apply_delta(delta_rad, dt, "scroll");
+    }
+
+    /// Integrate a MIDI jog movement using the same angular state and MISO
+    /// encoding as pointer/scroll input. Touch is controlled independently by
+    /// the learned jog-touch message; the outer ring never asserts touch.
+    pub(super) fn jog_midi_sample(&mut self, delta_rad: f32, dt: f32) {
+        self.midi_jog_motion_hold_sec = JOG_SCROLL_HOLD_SEC;
+        self.jog_apply_delta(delta_rad, dt, "midi");
+    }
+
+    pub(super) fn jog_midi_stop(&mut self) {
+        self.midi_jog_motion_hold_sec = 0.0;
+        self.jog_omega = 0.0;
     }
 
     /// Ends rotational drag: clears the pointer-angle baseline so free-spin

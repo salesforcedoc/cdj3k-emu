@@ -16,6 +16,30 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
+
+/// A host keyboard action waiting to be delivered to QEMU's virtual USB
+/// keyboard. Printable text is kept as Unicode here; the runtime drops
+/// characters that cannot be represented by the guest's US keyboard layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestKeyboardInput {
+    Text(char),
+    Backspace,
+    Delete,
+    Enter,
+    Escape,
+    Tab,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+}
+
+/// Bound pending keyboard work so an accidental multi-megabyte paste cannot
+/// make the runtime worker spend seconds replaying stale input.
+pub const MAX_GUEST_KEYBOARD_QUEUE: usize = 1024;
 
 /// Maximum instance count (slots are 1..=MAX_INSTANCES).
 pub const MAX_INSTANCES: u32 = 4;
@@ -44,6 +68,96 @@ pub const NET_SEL_VMNET_HOST: u32 = u32::MAX - 1;
 /// mode across launches. Not a valid BSD ifname, so it can never collide with
 /// a real interface returned by `getifaddrs`.
 pub const NET_IFACE_VMNET_HOST_TOKEN: &str = "__vmnet_host__";
+
+/// User-facing audio latency preset. The selected preset is stored per player
+/// and applied the next time that player's QEMU process starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioLatencyProfile {
+    Safe,
+    Balanced,
+    LowLatency,
+    Custom,
+}
+
+impl AudioLatencyProfile {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Safe => "Safe",
+            Self::Balanced => "Balanced",
+            Self::LowLatency => "Low Latency",
+            Self::Custom => "Custom",
+        }
+    }
+}
+
+/// The concrete knobs used by QEMU and the guest virtio-sound driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioLatencyTuning {
+    /// Silent stereo F32 frames queued before the CoreAudio reader starts.
+    pub startup_prefill_frames: u32,
+    /// Frames accumulated by the guest into one virtio-sound TX request.
+    pub guest_transfer_frames: u32,
+    /// CoreAudio device buffer request, in microseconds.
+    pub coreaudio_buffer_us: u32,
+}
+
+/// Per-player latency selection plus the values retained for Custom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioLatencySettings {
+    pub profile: AudioLatencyProfile,
+    pub custom: AudioLatencyTuning,
+}
+
+impl Default for AudioLatencySettings {
+    fn default() -> Self {
+        Self {
+            // Matches the proven settings used before profiles were exposed.
+            profile: AudioLatencyProfile::Balanced,
+            custom: Self::BALANCED,
+        }
+    }
+}
+
+impl AudioLatencySettings {
+    pub const SAFE: AudioLatencyTuning = AudioLatencyTuning {
+        startup_prefill_frames: 4096,
+        guest_transfer_frames: 1024,
+        coreaudio_buffer_us: 10_000,
+    };
+    pub const BALANCED: AudioLatencyTuning = AudioLatencyTuning {
+        startup_prefill_frames: 2048,
+        guest_transfer_frames: 1024,
+        coreaudio_buffer_us: 5_000,
+    };
+    pub const LOW_LATENCY: AudioLatencyTuning = AudioLatencyTuning {
+        startup_prefill_frames: 1024,
+        guest_transfer_frames: 512,
+        coreaudio_buffer_us: 3_000,
+    };
+
+    pub const fn effective(self) -> AudioLatencyTuning {
+        match self.profile {
+            AudioLatencyProfile::Safe => Self::SAFE,
+            AudioLatencyProfile::Balanced => Self::BALANCED,
+            AudioLatencyProfile::LowLatency => Self::LOW_LATENCY,
+            AudioLatencyProfile::Custom => self.custom,
+        }
+    }
+
+    /// Clamp Custom to combinations the 32-buffer guest pool can sustain.
+    /// Transfers remain multiples of the fixed 64-frame ALSA period, and the
+    /// startup prefill always covers at least two complete transfers.
+    pub fn sanitize_custom(mut tuning: AudioLatencyTuning) -> AudioLatencyTuning {
+        tuning.guest_transfer_frames = tuning.guest_transfer_frames.clamp(512, 2048);
+        tuning.guest_transfer_frames = (tuning.guest_transfer_frames / 64).max(8) * 64;
+        tuning.startup_prefill_frames = tuning
+            .startup_prefill_frames
+            .clamp(tuning.guest_transfer_frames * 2, 8192);
+        tuning.startup_prefill_frames = (tuning.startup_prefill_frames / 64) * 64;
+        tuning.coreaudio_buffer_us = tuning.coreaudio_buffer_us.clamp(3_000, 30_000);
+        tuning
+    }
+}
 
 /// Latched on shutdown.  **Async-signal-safe** so the SIGTERM/SIGINT handler
 /// can set it without taking the mutex (which would deadlock if a signal
@@ -88,6 +202,30 @@ pub struct AudioOutDevice {
     pub sample_rate_hz: u32,
 }
 
+/// Latest CDJ status decoded passively from this player's Pro DJ Link traffic.
+/// Text metadata (title/artist/album) is not part of the recurring UDP status
+/// packet; the source/slot/track id tuple is the key for a later DB-server
+/// metadata query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProlinkTrackStatus {
+    pub received_at: Instant,
+    pub source_ip: String,
+    pub device_name: String,
+    pub player_number: u8,
+    pub source_player: u8,
+    pub source_slot: u8,
+    pub track_type: u8,
+    pub track_id: u32,
+    pub track_number: u16,
+    pub play_state: u8,
+    pub state_flags: u8,
+    pub pitch_raw: u32,
+    pub track_bpm_x100: u16,
+    pub beat_number: u32,
+    pub beat_in_bar: u8,
+    pub firmware: String,
+}
+
 // ── Aggregate state ───────────────────────────────────────────────────────────
 
 /// All cross-thread UI / runtime state. Access via [`lock()`].
@@ -100,14 +238,20 @@ pub struct AppState {
     pub jog_screen_popped: bool,
     pub main_screen_popped: bool,
     pub debug_screen_popped: bool,
+    pub mixer_open: bool,
 
     // ── Emulation lifecycle ─────────────────────────────────────────────────
     /// Fires once; consumer clears after acting.
     pub stop_requested: bool,
     /// Set to `true` while QEMU is running; updated by the runtime worker.
     pub qemu_running: bool,
+    /// Host keystrokes queued by the active player's egui window. The runtime
+    /// worker drains these through the QMP-owned virtual USB keyboard.
+    pub guest_keyboard_input: Vec<GuestKeyboardInput>,
     /// Fires once to open the firmware install wizard.
     pub firmware_wizard_requested: bool,
+    /// Fires once to open the shared MIDI assignment window on this player's tab.
+    pub midi_learn_requested: bool,
     /// Fires once after provisioning completes to (re)start QEMU.
     pub qemu_boot_requested: bool,
     /// Fires once to stop and immediately restart QEMU.
@@ -136,11 +280,23 @@ pub struct AppState {
     /// worker to persist + restart QEMU.
     pub audio_enabled: bool,
     pub audio_toggle_requested: bool,
+    /// One-shot request to tear down and reopen the running player's host
+    /// audio path without restarting QEMU or the guest firmware.
+    pub audio_reset_requested: bool,
+    /// Opens the per-player audio latency profile editor.
+    pub audio_latency_requested: bool,
+    /// Current per-player latency selection mirrored for the UI/runtime.
+    pub audio_latency: AudioLatencySettings,
+    /// One-shot: persist the new latency selection and restart if audio is live.
+    pub audio_latency_apply_requested: bool,
+    /// Set by the runtime worker when a live audio reset fails. The menu
+    /// thread consumes this and presents a one-shot error dialog.
+    pub audio_error_message: Option<String>,
 
     // ── Audio output device ─────────────────────────────────────────────────
     /// Selected CoreAudio device UID, or `None` for "system default output".
-    /// Persisted in InstanceSettings. The runtime worker passes this through
-    /// to QEMU's `-audiodev coreaudio` config on (re)spawn.
+    /// Persisted once in the application-wide settings. Every player and the
+    /// singleton native mixer use the same selection.
     pub audio_device_uid: Option<String>,
     /// Cached enumeration of host output devices; refreshed by the menu
     /// thread on a 5 s tick via [`refresh_audio_devices`].
@@ -149,8 +305,13 @@ pub struct AppState {
     /// to rebuild the radio list.
     pub audio_device_list_version: u32,
     /// One-shot: set when the user picks a different device. The runtime
-    /// worker persists the new UID and restarts QEMU.
+    /// Worker persists the new UID and switches the native mixer output live.
     pub audio_device_toggle_requested: bool,
+    /// Dedicated headphone cue output UIDs; `None` means bus disabled.
+    pub cue_a_device_uid: Option<String>,
+    pub cue_b_device_uid: Option<String>,
+    pub cue_a_device_toggle_requested: bool,
+    pub cue_b_device_toggle_requested: bool,
 
     /// "Enable ALC (Experimental)" toggle. Mirrors the guest's
     /// `audio_sync_enabled` sysfs param.
@@ -169,6 +330,11 @@ pub struct AppState {
     /// Packed `(total << 32) | (guest << 16) | host`, all ms.  `u64::MAX` means
     /// "no data yet" and the menu shows `--` instead.
     pub latency_packed: u64,
+
+    /// Latest status this player published over Pro DJ Link. Captured at the
+    /// QEMU network boundary, so it is also available when the selected
+    /// backend is user-mode NAT.
+    pub prolink_track_status: Option<ProlinkTrackStatus>,
 
     // ── Network ─────────────────────────────────────────────────────────────
     /// Index into [`net_ifaces`], or one of [`NET_SEL_NONE`] / [`NET_SEL_MCAST`].
@@ -217,9 +383,12 @@ impl AppState {
             jog_screen_popped: false,
             main_screen_popped: false,
             debug_screen_popped: false,
+            mixer_open: false,
             stop_requested: false,
             qemu_running: false,
+            guest_keyboard_input: Vec::new(),
             firmware_wizard_requested: false,
+            midi_learn_requested: false,
             qemu_boot_requested: false,
             restart_requested: false,
             shade_forced: false,
@@ -229,15 +398,28 @@ impl AppState {
             mods_toggle_requested: false,
             audio_enabled: false,
             audio_toggle_requested: false,
+            audio_reset_requested: false,
+            audio_latency_requested: false,
+            audio_latency: AudioLatencySettings {
+                profile: AudioLatencyProfile::Balanced,
+                custom: AudioLatencySettings::BALANCED,
+            },
+            audio_latency_apply_requested: false,
+            audio_error_message: None,
             audio_device_uid: None,
             audio_devices: Vec::new(),
             audio_device_list_version: 0,
             audio_device_toggle_requested: false,
+            cue_a_device_uid: None,
+            cue_b_device_uid: None,
+            cue_a_device_toggle_requested: false,
+            cue_b_device_toggle_requested: false,
             alc_enabled: false,
             alc_toggle_requested: false,
             haptic_enabled: true,
             haptic_toggle_requested: false,
             latency_packed: u64::MAX,
+            prolink_track_status: None,
             selected_interface: NET_SEL_NONE,
             net_ifaces: Vec::new(),
             net_list_version: 0,

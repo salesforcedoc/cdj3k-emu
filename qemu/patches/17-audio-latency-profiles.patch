@@ -1,0 +1,91 @@
+diff --git a/hw/audio/virtio-snd.c b/hw/audio/virtio-snd.c
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -1009,7 +1009,7 @@
+  * 20 ms at 96 kHz F32 stereo = 96000 * 0.020 * 8 = 15360 bytes ≈ 12% of
+  * the 128 KB ring. Comfortably below half-full so the writer has plenty
+  * of room to push its first real data without overruns. */
+-#define VSND_BYPASS_PREFILL_BYTES 16384
++static uint32_t vsnd_bypass_prefill_bytes = 16384;
+ 
+ static void virtio_snd_bypass_set_active(int on, int src_fmt, uint32_t guest_rate)
+ {
+@@ -1041,9 +1041,9 @@
+              * and may hold stale data from a previous bypass session.
+              * Then publish head AFTER the zeros are visible so the
+              * IOProc never reads garbage. */
+-            memset(vsnd_bypass_ring, 0, VSND_BYPASS_PREFILL_BYTES);
++            memset(vsnd_bypass_ring, 0, vsnd_bypass_prefill_bytes);
+             atomic_store_explicit(&vsnd_bypass_head,
+-                                  VSND_BYPASS_PREFILL_BYTES,
++                                  vsnd_bypass_prefill_bytes,
+                                   memory_order_release);
+             /* Reset cubic-resampler sliding window on cold start - all
+              * four taps go to silence so the first emitted output
+@@ -1162,6 +1162,10 @@
+                        VIRTIO_SOUND_STREAM_DEFAULT),
+     DEFINE_PROP_UINT32("chmaps", VirtIOSound, snd_conf.chmaps,
+                        VIRTIO_SOUND_CHMAP_DEFAULT),
++    DEFINE_PROP_UINT32("x-prefill-frames", VirtIOSound,
++                       bypass_prefill_frames, 2048),
++    DEFINE_PROP_UINT32("x-tx-batch-periods", VirtIOSound,
++                       tx_batch_periods, 16),
+ };
+ 
+ static void
+@@ -1188,6 +1192,8 @@
+         uint32_t extra = virtio_snd_bypass_depth_frames();
+         uint32_t le = cpu_to_le32(extra);
+         memcpy(config + sizeof(virtio_snd_config), &le, sizeof(le));
++        le = cpu_to_le32(s->tx_batch_periods);
++        memcpy(config + sizeof(virtio_snd_config) + sizeof(le), &le, sizeof(le));
+     }
+ }
+ 
+@@ -2257,6 +2263,19 @@
+         return;
+     }
+ 
++    if (vsnd->tx_batch_periods < 8 || vsnd->tx_batch_periods > 32) {
++        error_setg(errp, "x-tx-batch-periods must be between 8 and 32");
++        return;
++    }
++    if (vsnd->bypass_prefill_frames < vsnd->tx_batch_periods * 64 * 2 ||
++        vsnd->bypass_prefill_frames > (VSND_BYPASS_BYTES / 16)) {
++        error_setg(errp,
++                   "x-prefill-frames must cover two TX batches and be <= %u",
++                   VSND_BYPASS_BYTES / 16);
++        return;
++    }
++    vsnd_bypass_prefill_bytes = vsnd->bypass_prefill_frames * 8;
++
+     if (!audio_be_check(&vsnd->audio_be, errp)) {
+         return;
+     }
+@@ -2269,11 +2288,9 @@
+     vsnd->pcm.pcm_params =
+         g_new0(virtio_snd_pcm_set_params, vsnd->snd_conf.streams);
+ 
+-    /* Config space layout: standard virtio_snd_config (12 bytes) followed
+-     * by 4 extra bytes carrying pipeline_extra_frames - depth of host
+-     * audio pipeline invisible to guest's frames_in_flight. The guest's
+-     * audio_latency_ms sysfs sums both. */
+-    virtio_init(vdev, VIRTIO_ID_SOUND, sizeof(virtio_snd_config) + 4);
++    /* Config space layout: standard virtio_snd_config followed by the host
++     * pipeline depth and the selected guest TX batch-period count. */
++    virtio_init(vdev, VIRTIO_ID_SOUND, sizeof(virtio_snd_config) + 8);
+     virtio_add_feature(&vsnd->features, VIRTIO_F_VERSION_1);
+ 
+     /* set default params for all streams */
+diff --git a/include/hw/audio/virtio-snd.h b/include/hw/audio/virtio-snd.h
+--- a/include/hw/audio/virtio-snd.h
++++ b/include/hw/audio/virtio-snd.h
+@@ -227,6 +227,8 @@
+     AudioBackend *audio_be;
+     VMChangeStateEntry *vmstate;
+     virtio_snd_config snd_conf;
++    uint32_t bypass_prefill_frames;
++    uint32_t tx_batch_periods;
+     QemuMutex cmdq_mutex;
+     QTAILQ_HEAD(, virtio_snd_ctrl_command) cmdq;
+     bool processing_cmdq;

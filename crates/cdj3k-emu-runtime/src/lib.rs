@@ -4,6 +4,7 @@ pub mod ffi;
 pub mod instance;
 #[cfg(target_os = "macos")]
 mod macos_disk;
+pub mod prolink;
 pub mod qmp;
 pub mod shutdown;
 pub mod tapbridge;

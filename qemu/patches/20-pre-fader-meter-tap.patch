@@ -1,0 +1,19 @@
+diff --git a/audio/coreaudio.m b/audio/coreaudio.m
+--- a/audio/coreaudio.m
++++ b/audio/coreaudio.m
+@@ -693,6 +693,7 @@ static void cdj3k_mixer_process(CoreaudioVoiceOut *core, void *buffer,
+                          + mid_band * core->mixer_mid_gain
+                          + high_band * core->mixer_high_gain;
+             output *= core->mixer_trim_gain;
++            float meter_sample = output;
+ 
+             if (core->mixer_filter_mode == 0) {
+                 core->mixer_filter_state[state] = output;
+@@ -704,7 +705,6 @@ static void cdj3k_mixer_process(CoreaudioVoiceOut *core, void *buffer,
+                     : output - core->mixer_filter_state[state];
+             }
+             output *= core->mixer_fader_gain * core->mixer_crossfader_gain;
+-            float meter_sample = output;
+             output = MAX(-1.0f, MIN(1.0f, output));
+             samples[index] = output;
+             peak[state] = MAX(peak[state], fabsf(meter_sample));

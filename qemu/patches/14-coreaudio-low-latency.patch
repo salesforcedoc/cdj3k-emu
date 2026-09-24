@@ -1,0 +1,908 @@
+diff --git a/audio/coreaudio.m b/audio/coreaudio.m
+index 5fbb645..b025e46 100644
+--- a/audio/coreaudio.m
++++ b/audio/coreaudio.m
+@@ -84,6 +84,19 @@
+     float mixer_fader_gain;
+     float mixer_filter_alpha;
+     int mixer_filter_mode;
++    uint32_t mixer_control_cache[6];
++    float mixer_coefficient_rate;
++    float mixer_target_trim;
++    float mixer_target_high;
++    float mixer_target_mid;
++    float mixer_target_low;
++    float mixer_target_fader;
++    float mixer_target_filter_alpha;
++    float mixer_low_alpha;
++    float mixer_high_alpha;
++    int mixer_target_filter_mode;
++    bool mixer_coefficients_valid;
++    bool rate_listener_installed;
+ } CoreaudioVoiceOut;
+ 
+ /* AudioDeviceID currently bound by init_out_device. Used by the HAL
+@@ -122,6 +135,31 @@
+     kAudioObjectPropertyElementMain
+ };
+ 
++static const AudioObjectPropertyAddress out_stream_format_addr = {
++    kAudioDevicePropertyStreamFormat,
++    kAudioDevicePropertyScopeOutput,
++    kAudioObjectPropertyElementMain
++};
++
++static const AudioObjectPropertyAddress out_frame_size_addr = {
++    kAudioDevicePropertyBufferFrameSize,
++    kAudioDevicePropertyScopeOutput,
++    kAudioObjectPropertyElementMain
++};
++
++static OSStatus coreaudio_get_out_streamformat(
++    AudioDeviceID id, AudioStreamBasicDescription *description)
++{
++    UInt32 size = sizeof(*description);
++
++    return AudioObjectGetPropertyData(id,
++                                      &out_stream_format_addr,
++                                      0,
++                                      NULL,
++                                      &size,
++                                      description);
++}
++
+ /* Resolve a CoreAudio device UID to its AudioDeviceID. Returns
+  * kAudioDeviceUnknown if the UID doesn't match any live device. */
+ static AudioDeviceID coreaudio_resolve_uid(const char *uid_cstr)
+@@ -200,14 +238,9 @@ static OSStatus coreaudio_get_out_framesizerange(AudioDeviceID id,
+ static OSStatus coreaudio_get_out_framesize(AudioDeviceID id, UInt32 *framesize)
+ {
+     UInt32 size = sizeof(*framesize);
+-    AudioObjectPropertyAddress addr = {
+-        kAudioDevicePropertyBufferFrameSize,
+-        kAudioDevicePropertyScopeOutput,
+-        kAudioObjectPropertyElementMain
+-    };
+ 
+     return AudioObjectGetPropertyData(id,
+-                                      &addr,
++                                      &out_frame_size_addr,
+                                       0,
+                                       NULL,
+                                       &size,
+@@ -217,14 +250,9 @@ static OSStatus coreaudio_get_out_framesize(AudioDeviceID id, UInt32 *framesize)
+ static OSStatus coreaudio_set_out_framesize(AudioDeviceID id, UInt32 *framesize)
+ {
+     UInt32 size = sizeof(*framesize);
+-    AudioObjectPropertyAddress addr = {
+-        kAudioDevicePropertyBufferFrameSize,
+-        kAudioDevicePropertyScopeOutput,
+-        kAudioObjectPropertyElementMain
+-    };
+ 
+     return AudioObjectSetPropertyData(id,
+-                                      &addr,
++                                      &out_frame_size_addr,
+                                       0,
+                                       NULL,
+                                       size,
+@@ -258,7 +286,7 @@ uint32_t coreaudio_get_static_latency_frames(void)
+                                 memory_order_relaxed);
+ }
+ 
+-/* cdj3k-emu: cached current nominal sample rate of the bound device.
++/* cdj3k-emu: cached current output-stream sample rate of the bound device.
+  * The original implementation issued a synchronous HAL property read on
+  * every call. Because the guest pulls virtio-snd config (and thus this
+  * value, via virtio_snd_bypass_depth_frames) from a sysfs polling loop,
+@@ -270,7 +298,7 @@ uint32_t coreaudio_get_static_latency_frames(void)
+  * (handle_rate_change), which fires off-BQL. */
+ static _Atomic uint32_t g_coreaudio_cached_samplerate;
+ 
+-/* Re-query the device's nominal rate and update the cache. Safe to call
++/* Re-query the device's output-stream rate and update the cache. Safe to call
+  * from any thread: AudioObjectGetPropertyData is thread-safe and the
+  * cache write is a single atomic store. Returns the rate it stored, or
+  * 0 if the read failed (in which case the cache is also zeroed). */
+@@ -281,12 +309,25 @@ static unsigned coreaudio_refresh_cached_samplerate(AudioDeviceID device_id)
+                               memory_order_relaxed);
+         return 0;
+     }
++    AudioStreamBasicDescription stream_format = { 0 };
+     Float64 rate = 0;
+-    UInt32 size = sizeof(rate);
+-    OSStatus status = AudioObjectGetPropertyData(device_id, &device_rate_addr,
+-                                                 0, NULL, &size, &rate);
++    OSStatus status = coreaudio_get_out_streamformat(device_id,
++                                                     &stream_format);
++
++    /* The virtual stream's rate is the clock seen by the IOProc. It can
++     * differ from the device's nominal rate on aggregate and loopback
++     * devices, so prefer it for resampling, mixer coefficients and latency
++     * accounting. Fall back to the nominal rate only when the stream does
++     * not expose a usable value. */
++    if (status == kAudioHardwareNoError && stream_format.mSampleRate > 0) {
++        rate = stream_format.mSampleRate;
++    } else {
++        UInt32 size = sizeof(rate);
++        status = AudioObjectGetPropertyData(device_id, &device_rate_addr,
++                                            0, NULL, &size, &rate);
++    }
+     unsigned u = (status == kAudioHardwareNoError && rate > 0)
+-                     ? (unsigned)rate : 0;
++                     ? (unsigned)(rate + 0.5) : 0;
+     atomic_store_explicit(&g_coreaudio_cached_samplerate, u,
+                           memory_order_relaxed);
+     return u;
+@@ -305,14 +346,9 @@ static OSStatus coreaudio_set_out_streamformat(AudioDeviceID id,
+                                                AudioStreamBasicDescription *d)
+ {
+     UInt32 size = sizeof(*d);
+-    AudioObjectPropertyAddress addr = {
+-        kAudioDevicePropertyStreamFormat,
+-        kAudioDevicePropertyScopeOutput,
+-        kAudioObjectPropertyElementMain
+-    };
+ 
+     return AudioObjectSetPropertyData(id,
+-                                      &addr,
++                                      &out_stream_format_addr,
+                                       0,
+                                       NULL,
+                                       size,
+@@ -476,10 +512,15 @@ static ret_type glue(coreaudio_, name)args_decl                   \
+                        (hw, buf, size))
+ #undef COREAUDIO_WRAPPER_FUNC
+ 
+-static float cdj3k_mixer_norm(_Atomic uint32_t *value)
++static uint32_t cdj3k_mixer_control(_Atomic uint32_t *value)
+ {
+     uint32_t raw = atomic_load_explicit(value, memory_order_relaxed);
+-    return MIN(raw, 1000u) / 1000.0f;
++    return MIN(raw, 1000u);
++}
++
++static float cdj3k_mixer_norm(uint32_t value)
++{
++    return value / 1000.0f;
+ }
+ 
+ static float cdj3k_mixer_eq_gain(float value)
+@@ -498,6 +539,62 @@ static float cdj3k_mixer_alpha(float cutoff, float sample_rate)
+     return 1.0f - expf(-2.0f * (float)M_PI * cutoff / sample_rate);
+ }
+ 
++/* Recompute transcendental mixer coefficients only when a control or the
++ * live HAL stream rate changes. The per-buffer ramps below still run on every
++ * callback, preserving the existing click-free control response. */
++static void cdj3k_mixer_update_coefficients(CoreaudioVoiceOut *core,
++                                            Cdj3kMixerChannel *channel,
++                                            float sample_rate)
++{
++    uint32_t control[6];
++
++    for (size_t i = 0; i < ARRAY_SIZE(control); i++) {
++        control[i] = cdj3k_mixer_control(&channel->control[i]);
++    }
++    if (core->mixer_coefficients_valid
++        && core->mixer_coefficient_rate == sample_rate
++        && memcmp(control, core->mixer_control_cache,
++                  sizeof(control)) == 0) {
++        return;
++    }
++
++    float trim = cdj3k_mixer_norm(control[0]);
++    float high = cdj3k_mixer_norm(control[1]);
++    float mid = cdj3k_mixer_norm(control[2]);
++    float low = cdj3k_mixer_norm(control[3]);
++    float filter = cdj3k_mixer_norm(control[4]);
++    float fader = cdj3k_mixer_norm(control[5]);
++    float target_filter_alpha = core->mixer_filter_alpha;
++    int target_filter_mode = 0;
++
++    core->mixer_target_trim =
++        powf(10.0f, ((trim - 0.5f) * 24.0f) / 20.0f);
++    core->mixer_target_high = cdj3k_mixer_eq_gain(high);
++    core->mixer_target_mid = cdj3k_mixer_eq_gain(mid);
++    core->mixer_target_low = cdj3k_mixer_eq_gain(low);
++    core->mixer_target_fader = fader * fader * fader;
++
++    if (filter < 0.48f) {
++        float position = filter / 0.48f;
++        float cutoff = 80.0f * powf(18000.0f / 80.0f, position);
++        target_filter_alpha = cdj3k_mixer_alpha(cutoff, sample_rate);
++        target_filter_mode = -1; /* low-pass */
++    } else if (filter > 0.52f) {
++        float position = (filter - 0.52f) / 0.48f;
++        float cutoff = 20.0f * powf(10000.0f / 20.0f, position);
++        target_filter_alpha = cdj3k_mixer_alpha(cutoff, sample_rate);
++        target_filter_mode = 1; /* high-pass */
++    }
++
++    core->mixer_target_filter_alpha = target_filter_alpha;
++    core->mixer_target_filter_mode = target_filter_mode;
++    core->mixer_low_alpha = cdj3k_mixer_alpha(250.0f, sample_rate);
++    core->mixer_high_alpha = cdj3k_mixer_alpha(4000.0f, sample_rate);
++    memcpy(core->mixer_control_cache, control, sizeof(control));
++    core->mixer_coefficient_rate = sample_rate;
++    core->mixer_coefficients_valid = true;
++}
++
+ static void cdj3k_mixer_publish_silence(CoreaudioVoiceOut *core)
+ {
+     if (!core->mixer_channel) {
+@@ -517,7 +614,7 @@ static void cdj3k_mixer_process(CoreaudioVoiceOut *core, void *buffer,
+ {
+     Cdj3kMixerChannel *channel = core->mixer_channel;
+     unsigned channels = core->hw.info.nchannels;
+-    float sample_rate = core->hw.info.freq;
++    float sample_rate = coreaudio_get_active_samplerate();
+     float *samples = buffer;
+     float peak[2] = { 0.0f, 0.0f };
+ 
+@@ -525,44 +622,26 @@ static void cdj3k_mixer_process(CoreaudioVoiceOut *core, void *buffer,
+         return;
+     }
+ 
+-    float trim = cdj3k_mixer_norm(&channel->control[0]);
+-    float high = cdj3k_mixer_norm(&channel->control[1]);
+-    float mid = cdj3k_mixer_norm(&channel->control[2]);
+-    float low = cdj3k_mixer_norm(&channel->control[3]);
+-    float filter = cdj3k_mixer_norm(&channel->control[4]);
+-    float fader = cdj3k_mixer_norm(&channel->control[5]);
+-    float target_trim = powf(10.0f, ((trim - 0.5f) * 24.0f) / 20.0f);
+-    float target_high = cdj3k_mixer_eq_gain(high);
+-    float target_mid = cdj3k_mixer_eq_gain(mid);
+-    float target_low = cdj3k_mixer_eq_gain(low);
+-    float target_fader = fader * fader * fader;
+-    float target_filter_alpha = core->mixer_filter_alpha;
+-    int target_filter_mode = 0;
+-
+-    if (filter < 0.48f) {
+-        float position = filter / 0.48f;
+-        float cutoff = 80.0f * powf(18000.0f / 80.0f, position);
+-        target_filter_alpha = cdj3k_mixer_alpha(cutoff, sample_rate);
+-        target_filter_mode = -1; /* low-pass */
+-    } else if (filter > 0.52f) {
+-        float position = (filter - 0.52f) / 0.48f;
+-        float cutoff = 20.0f * powf(10000.0f / 20.0f, position);
+-        target_filter_alpha = cdj3k_mixer_alpha(cutoff, sample_rate);
+-        target_filter_mode = 1; /* high-pass */
++    if (sample_rate <= 0.0f) {
++        sample_rate = core->hw.info.freq;
+     }
++    cdj3k_mixer_update_coefficients(core, channel, sample_rate);
+ 
+     float inv_frames = 1.0f / frames;
+-    float trim_step = (target_trim - core->mixer_trim_gain) * inv_frames;
+-    float high_step = (target_high - core->mixer_high_gain) * inv_frames;
+-    float mid_step = (target_mid - core->mixer_mid_gain) * inv_frames;
+-    float low_step = (target_low - core->mixer_low_gain) * inv_frames;
+-    float fader_step = (target_fader - core->mixer_fader_gain) * inv_frames;
+-    float filter_step = (target_filter_alpha - core->mixer_filter_alpha)
+-                        * inv_frames;
+-    float low_alpha = cdj3k_mixer_alpha(250.0f, sample_rate);
+-    float high_alpha = cdj3k_mixer_alpha(4000.0f, sample_rate);
+-
+-    core->mixer_filter_mode = target_filter_mode;
++    float trim_step = (core->mixer_target_trim - core->mixer_trim_gain)
++                      * inv_frames;
++    float high_step = (core->mixer_target_high - core->mixer_high_gain)
++                      * inv_frames;
++    float mid_step = (core->mixer_target_mid - core->mixer_mid_gain)
++                     * inv_frames;
++    float low_step = (core->mixer_target_low - core->mixer_low_gain)
++                     * inv_frames;
++    float fader_step = (core->mixer_target_fader - core->mixer_fader_gain)
++                       * inv_frames;
++    float filter_step = (core->mixer_target_filter_alpha
++                         - core->mixer_filter_alpha) * inv_frames;
++
++    core->mixer_filter_mode = core->mixer_target_filter_mode;
+     for (UInt32 frame = 0; frame < frames; frame++) {
+         core->mixer_trim_gain += trim_step;
+         core->mixer_high_gain += high_step;
+@@ -576,9 +655,9 @@ static void cdj3k_mixer_process(CoreaudioVoiceOut *core, void *buffer,
+             size_t index = (size_t)frame * channels + stream;
+             float input = samples[index];
+ 
+-            core->mixer_low_state[state] += low_alpha
++            core->mixer_low_state[state] += core->mixer_low_alpha
+                 * (input - core->mixer_low_state[state]);
+-            core->mixer_high_state[state] += high_alpha
++            core->mixer_high_state[state] += core->mixer_high_alpha
+                 * (input - core->mixer_high_state[state]);
+             float low_band = core->mixer_low_state[state];
+             float mid_band = core->mixer_high_state[state] - low_band;
+@@ -604,12 +683,12 @@ static void cdj3k_mixer_process(CoreaudioVoiceOut *core, void *buffer,
+         }
+     }
+ 
+-    core->mixer_trim_gain = target_trim;
+-    core->mixer_high_gain = target_high;
+-    core->mixer_mid_gain = target_mid;
+-    core->mixer_low_gain = target_low;
+-    core->mixer_fader_gain = target_fader;
+-    core->mixer_filter_alpha = target_filter_alpha;
++    core->mixer_trim_gain = core->mixer_target_trim;
++    core->mixer_high_gain = core->mixer_target_high;
++    core->mixer_mid_gain = core->mixer_target_mid;
++    core->mixer_low_gain = core->mixer_target_low;
++    core->mixer_fader_gain = core->mixer_target_fader;
++    core->mixer_filter_alpha = core->mixer_target_filter_alpha;
+     if (channels == 1) {
+         peak[1] = peak[0];
+     }
+@@ -634,6 +713,7 @@ static void cdj3k_mixer_init(CoreaudioVoiceOut *core)
+     core->mixer_low_gain = 1.0f;
+     core->mixer_fader_gain = 1.0f;
+     core->mixer_filter_alpha = 1.0f;
++    core->mixer_coefficients_valid = false;
+     if (!path || !path[0] || channel_index < 0
+         || channel_index >= CDJ3K_MIXER_CHANNELS
+         || (end && *end != '\0')) {
+@@ -682,6 +762,20 @@ static void cdj3k_mixer_fini(CoreaudioVoiceOut *core)
+     }
+ }
+ 
++static void coreaudio_silence_output(AudioBufferList *output)
++{
++    if (!output) {
++        return;
++    }
++    for (UInt32 i = 0; i < output->mNumberBuffers; i++) {
++        AudioBuffer *buffer = &output->mBuffers[i];
++
++        if (buffer->mData && buffer->mDataByteSize) {
++            memset(buffer->mData, 0, buffer->mDataByteSize);
++        }
++    }
++}
++
+ /*
+  * callback to feed audiooutput buffer. called without BQL.
+  * allowed to lock "buf_mutex", but disallowed to have any other locks.
+@@ -696,16 +790,53 @@ static OSStatus out_device_ioproc(
+     void *hwptr)
+ {
+     UInt32 frame_size, pending_frames;
+-    void *out = outOutputData->mBuffers[0].mData;
+-    void *out_start = out;
+     HWVoiceOut *hw = hwptr;
+     CoreaudioVoiceOut *core = hwptr;
++    AudioBuffer *output;
++    void *out;
++    void *out_start;
+     size_t len;
+ 
++    if (!outOutputData || outOutputData->mNumberBuffers == 0
++        || hw->info.bytes_per_frame <= 0) {
++        coreaudio_silence_output(outOutputData);
++        cdj3k_mixer_publish_silence(core);
++        return 0;
++    }
++
++    /* The negotiated format is interleaved, so the first buffer contains
++     * every channel. Clear any extra buffers defensively: aggregate devices
++     * can occasionally expose additional streams in their callback list. */
++    for (UInt32 i = 1; i < outOutputData->mNumberBuffers; i++) {
++        AudioBuffer *extra = &outOutputData->mBuffers[i];
++
++        if (extra->mData && extra->mDataByteSize) {
++            memset(extra->mData, 0, extra->mDataByteSize);
++        }
++    }
++    output = &outOutputData->mBuffers[0];
++    if (!output->mData
++        || output->mDataByteSize % hw->info.bytes_per_frame != 0
++        || (output->mNumberChannels != 0
++            && output->mNumberChannels != hw->info.nchannels)) {
++        coreaudio_silence_output(outOutputData);
++        cdj3k_mixer_publish_silence(core);
++        return 0;
++    }
++
++    out = output->mData;
++    out_start = out;
++    len = output->mDataByteSize;
++    frame_size = len / hw->info.bytes_per_frame;
++    if (frame_size == 0) {
++        cdj3k_mixer_publish_silence(core);
++        return 0;
++    }
++
+     /* cdj3k-emu: bypass fast-path is LOCK-FREE and runs BEFORE buf_mutex
+-     * acquire. The ring is SPSC-atomic and the device_frame_size /
+-     * bytes_per_frame / device_id fields are set once at init and never
+-     * mutated, so the bypass read needs no synchronization. Hoisting this
++     * acquire. The ring is SPSC-atomic and bytes_per_frame / device_id are
++     * set once at init and never mutated, so the bypass read needs no
++     * synchronization. Hoisting this
+      * above the mutex is critical for stress robustness: QEMU's audio
+      * frontend periodically calls our `audio_generic_*` wrappers (each
+      * grabs buf_mutex) on the main thread; if the main thread is
+@@ -715,9 +846,6 @@ static OSStatus out_device_ioproc(
+      * sustained main-thread preemption, sample-uncorrelated white noise.
+      * The fix is to never block in the IOProc when the bypass owns the
+      * stream. */
+-    frame_size = core->device_frame_size;
+-    len = frame_size * hw->info.bytes_per_frame;
+-
+     extern int virtio_snd_bypass_is_active(void) __attribute__((weak_import));
+     extern size_t virtio_snd_bypass_avail(void) __attribute__((weak_import));
+     extern size_t virtio_snd_bypass_read(void *dst, size_t bytes)
+@@ -865,24 +993,131 @@ static OSStatus handle_rate_change(AudioObjectID in_object_id,
+     return noErr;
+ }
+ 
++static bool coreaudio_streamformat_is_compatible(
++    const AudioStreamBasicDescription *format, unsigned channels)
++{
++    return format->mSampleRate > 0
++        && format->mFormatID == kAudioFormatLinearPCM
++        && (format->mFormatFlags & kAudioFormatFlagIsFloat) != 0
++        && (format->mFormatFlags & kAudioFormatFlagIsBigEndian) == 0
++        && (format->mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
++        && format->mBitsPerChannel == sizeof(float) * 8
++        && format->mChannelsPerFrame == channels
++        && format->mFramesPerPacket == 1
++        && format->mBytesPerFrame == channels * sizeof(float)
++        && format->mBytesPerPacket == format->mBytesPerFrame;
++}
++
++/* Keep a device's existing virtual format whenever it already matches the
++ * interleaved float buffer produced by this backend. This matters for
++ * loopback/aggregate drivers, which often expose a valid fixed format but
++ * reject otherwise-redundant SetProperty calls. */
++static OSStatus coreaudio_negotiate_out_streamformat(
++    CoreaudioVoiceOut *core, AudioDeviceID device_id,
++    AudioStreamBasicDescription *active_format)
++{
++    AudioStreamBasicDescription current = { 0 };
++    OSStatus status = coreaudio_get_out_streamformat(device_id, &current);
++
++    if (status != kAudioHardwareNoError) {
++        coreaudio_playback_logerr(status,
++                                  "Could not get output stream format");
++        return status;
++    }
++    if (coreaudio_streamformat_is_compatible(&current,
++                                              core->hw.info.nchannels)) {
++        *active_format = current;
++        return kAudioHardwareNoError;
++    }
++
++    Float64 rate = current.mSampleRate;
++    if (rate <= 0) {
++        UInt32 size = sizeof(rate);
++
++        status = AudioObjectGetPropertyData(device_id, &device_rate_addr,
++                                            0, NULL, &size, &rate);
++        if (status != kAudioHardwareNoError || rate <= 0) {
++            if (status != kAudioHardwareNoError) {
++                coreaudio_playback_logerr(
++                    status, "Could not determine output stream rate");
++                return status;
++            }
++            error_report("coreaudio: output device reports no usable "
++                         "stream or nominal sample rate");
++            return kAudioHardwareIllegalOperationError;
++        }
++    }
++
++    AudioStreamBasicDescription requested = {
++        .mBitsPerChannel = sizeof(float) * 8,
++        .mBytesPerFrame = core->hw.info.nchannels * sizeof(float),
++        .mBytesPerPacket = core->hw.info.nchannels * sizeof(float),
++        .mChannelsPerFrame = core->hw.info.nchannels,
++        .mFormatFlags = kAudioFormatFlagsNativeFloatPacked,
++        .mFormatID = kAudioFormatLinearPCM,
++        .mFramesPerPacket = 1,
++        .mSampleRate = rate,
++    };
++    Boolean settable = false;
++
++    status = AudioObjectIsPropertySettable(device_id,
++                                           &out_stream_format_addr,
++                                           &settable);
++    if (status != kAudioHardwareNoError) {
++        coreaudio_playback_logerr(status,
++                                  "Could not query output stream format mutability");
++        return status;
++    }
++    if (!settable) {
++        error_report("coreaudio: output stream format is fixed and incompatible "
++                     "with %u-channel interleaved float32 playback "
++                     "(rate=%.0f channels=%u bits=%u flags=0x%x)",
++                     core->hw.info.nchannels, current.mSampleRate,
++                     (unsigned)current.mChannelsPerFrame,
++                     (unsigned)current.mBitsPerChannel,
++                     (unsigned)current.mFormatFlags);
++        return kAudioHardwareIllegalOperationError;
++    }
++
++    status = coreaudio_set_out_streamformat(device_id, &requested);
++    if (status != kAudioHardwareNoError) {
++        coreaudio_playback_logerr(status,
++                                  "Could not set compatible output stream format");
++        return status;
++    }
++
++    status = coreaudio_get_out_streamformat(device_id, &current);
++    if (status != kAudioHardwareNoError) {
++        coreaudio_playback_logerr(status,
++                                  "Could not verify output stream format");
++        return status;
++    }
++    if (!coreaudio_streamformat_is_compatible(&current,
++                                               core->hw.info.nchannels)) {
++        error_report("coreaudio: device did not accept a compatible "
++                     "%u-channel interleaved float32 stream format",
++                     core->hw.info.nchannels);
++        return kAudioHardwareIllegalOperationError;
++    }
++
++    *active_format = current;
++    return kAudioHardwareNoError;
++}
++
+ static OSStatus init_out_device(CoreaudioVoiceOut *core)
+ {
+     AudioDeviceID device_id;
+     AudioDeviceIOProcID ioprocid;
++    AudioStreamBasicDescription stream_basic_description = { 0 };
+     AudioValueRange value_range;
+     OSStatus status;
+     UInt32 device_frame_size;
++    Audiodev *dev = core->hw.s->dev;
++    AudiodevCoreaudioPerDirectionOptions *cpdo = dev->u.coreaudio.out;
+ 
+-    AudioStreamBasicDescription stream_basic_description = {
+-        .mBitsPerChannel = audio_format_bits(core->hw.info.af),
+-        .mBytesPerFrame = core->hw.info.bytes_per_frame,
+-        .mBytesPerPacket = core->hw.info.bytes_per_frame,
+-        .mChannelsPerFrame = core->hw.info.nchannels,
+-        .mFormatFlags = kLinearPCMFormatFlagIsFloat,
+-        .mFormatID = kAudioFormatLinearPCM,
+-        .mFramesPerPacket = 1,
+-        .mSampleRate = core->hw.info.freq
+-    };
++    core->device_id = kAudioDeviceUnknown;
++    core->ioprocid = NULL;
++    core->rate_listener_installed = false;
+ 
+     status = coreaudio_get_voice_out(&device_id);
+     if (status != kAudioHardwareNoError) {
+@@ -893,18 +1128,27 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
+     if (device_id == kAudioDeviceUnknown) {
+         error_report("coreaudio: Could not initialize playback: "
+                      "Unknown audio device");
+-        return status;
++        return kAudioHardwareBadDeviceError;
+     }
+ 
+-    /* cdj3k-emu: publish device id so virtio-snd can query the HAL rate at
+-     * bypass-activation time. */
+-    cdj3k_emu_active_output_device = device_id;
++    status = coreaudio_negotiate_out_streamformat(
++        core, device_id, &stream_basic_description);
++    if (status != kAudioHardwareNoError) {
++        return status;
++    }
+ 
+-    /* cdj3k-emu: seed the samplerate cache once, on the BQL thread, before
+-     * the guest starts polling virtio-snd config. From here on the cache
+-     * is kept fresh exclusively by the rate-change listener installed
+-     * later in this function. */
+-    coreaudio_refresh_cached_samplerate(device_id);
++    /* Convert the requested duration to frames using the HAL stream's
++     * actual clock rate. Recompute from the duration on every device init;
++     * rescaling a prior frame count would accumulate error across handoffs. */
++    struct audsettings device_as = {
++        .freq = (int)(stream_basic_description.mSampleRate + 0.5),
++        .nchannels = core->hw.info.nchannels,
++        .fmt = AUDIO_FORMAT_F32,
++        .big_endian = false,
++    };
++    core->frame_size_setting = audio_buffer_frames(
++        qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo),
++        &device_as, 11610);
+ 
+     /* Query static device latency: kAudioDevicePropertyLatency +
+      * kAudioDevicePropertySafetyOffset (USB transit + DAC pipeline). */
+@@ -939,9 +1183,6 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
+ 
+     /* get minimum and maximum buffer frame sizes */
+     status = coreaudio_get_out_framesizerange(device_id, &value_range);
+-    if (status == kAudioHardwareBadObjectError) {
+-        return 0;
+-    }
+     if (status != kAudioHardwareNoError) {
+         coreaudio_playback_logerr(status,
+                                   "Could not get device buffer frame range");
+@@ -960,59 +1201,56 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
+         device_frame_size = core->frame_size_setting;
+     }
+ 
+-    /* set Buffer Frame Size */
+-    status = coreaudio_set_out_framesize(device_id, &device_frame_size);
+-    if (status == kAudioHardwareBadObjectError) {
+-        return 0;
+-    }
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not set device buffer frame size %" PRIu32,
+-                                  (uint32_t)device_frame_size);
+-        return status;
+-    }
+-
+-    /* get Buffer Frame Size */
+-    status = coreaudio_get_out_framesize(device_id, &device_frame_size);
+-    if (status == kAudioHardwareBadObjectError) {
+-        return 0;
+-    }
++    UInt32 current_frame_size = 0;
++    status = coreaudio_get_out_framesize(device_id, &current_frame_size);
+     if (status != kAudioHardwareNoError) {
+         coreaudio_playback_logerr(status,
+                                   "Could not get device buffer frame size");
+         return status;
+     }
++    if (current_frame_size != device_frame_size) {
++        Boolean settable = false;
+ 
+-    /* Set the IOProc's stream sample-rate to the device's current
+-     * nominal rate. We deliberately do NOT force a particular rate via
+-     * SetProperty(NominalSampleRate): on several macOS devices the set
+-     * is silently rolled back the moment CreateIOProcID/AudioDeviceStart
+-     * runs, clobbering whatever we asked for. The writer-side resampler
+-     * handles any guest-vs-HAL rate mismatch instead, so this just
+-     * tells CoreAudio "treat the bytes I hand you as data at the
+-     * device's current clock rate". */
+-    {
+-        Float64 current_rate = 0;
+-        UInt32 sz = sizeof(current_rate);
+-        if (AudioObjectGetPropertyData(device_id, &device_rate_addr, 0,
+-                                       NULL, &sz, &current_rate)
+-                == kAudioHardwareNoError && current_rate > 0) {
+-            stream_basic_description.mSampleRate = current_rate;
++        status = AudioObjectIsPropertySettable(device_id,
++                                               &out_frame_size_addr,
++                                               &settable);
++        if (status != kAudioHardwareNoError) {
++            coreaudio_playback_logerr(
++                status, "Could not query buffer frame size mutability");
++            return status;
++        }
++        if (settable) {
++            status = coreaudio_set_out_framesize(device_id,
++                                                 &device_frame_size);
++            if (status != kAudioHardwareNoError) {
++                coreaudio_playback_logerr(
++                    status, "Could not set device buffer frame size %" PRIu32,
++                    (uint32_t)device_frame_size);
++                return status;
++            }
++        } else {
++            warn_report("coreaudio: Device buffer frame size is fixed at %u "
++                        "frames (requested %u)",
++                        (unsigned)current_frame_size,
++                        (unsigned)device_frame_size);
++            device_frame_size = current_frame_size;
+         }
+     }
+ 
+-    /* set Samplerate */
+-    status = coreaudio_set_out_streamformat(device_id,
+-                                            &stream_basic_description);
+-    if (status == kAudioHardwareBadObjectError) {
+-        return 0;
+-    }
++    /* Read back the actual size: drivers may clamp a set request further. */
++    status = coreaudio_get_out_framesize(device_id, &device_frame_size);
+     if (status != kAudioHardwareNoError) {
+         coreaudio_playback_logerr(status,
+-                                  "Could not set samplerate %lf",
+-                                  stream_basic_description.mSampleRate);
++                                  "Could not get device buffer frame size");
+         return status;
+     }
++    fprintf(stderr,
++            "coreaudio: output stream %.0f Hz, buffer requested=%d "
++            "actual=%u frames (%.2f ms)\n",
++            stream_basic_description.mSampleRate,
++            core->frame_size_setting, (unsigned)device_frame_size,
++            1000.0 * device_frame_size
++                / stream_basic_description.mSampleRate);
+ 
+     /*
+      * set Callback.
+@@ -1029,10 +1267,10 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
+                                        out_device_ioproc,
+                                        &core->hw,
+                                        &ioprocid);
+-    if (status == kAudioHardwareBadDeviceError) {
+-        return 0;
+-    }
+     if (status != kAudioHardwareNoError || ioprocid == NULL) {
++        if (status == kAudioHardwareNoError) {
++            status = kAudioHardwareUnspecifiedError;
++        }
+         coreaudio_playback_logerr(status, "Could not set IOProc");
+         return status;
+     }
+@@ -1042,6 +1280,10 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
+     core->hw.samples = core->buffer_count * core->device_frame_size;
+     audio_generic_initialize_buffer_out(&core->hw);
+     core->ioprocid = ioprocid;
++    atomic_store_explicit(
++        &g_coreaudio_cached_samplerate,
++        (unsigned)(stream_basic_description.mSampleRate + 0.5),
++        memory_order_relaxed);
+ 
+     /* Subscribe to nominal-rate changes on the bound device. If the
+      * user opens AMS, Audio Hijack flips the device rate, or BT
+@@ -1061,6 +1303,8 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
+             coreaudio_playback_logerr(lst,
+                                       "Could not listen for nominal rate changes "
+                                       "(cached samplerate may go stale on HAL rate flips)");
++        } else {
++            core->rate_listener_installed = true;
+         }
+     }
+ 
+@@ -1071,24 +1315,53 @@ static OSStatus init_out_device(CoreaudioVoiceOut *core)
+      * the bypass ring is empty, so leaving it running is harmless. */
+     core->enabled = true;
+     status = AudioDeviceStart(core->device_id, core->ioprocid);
+-    if (status != kAudioHardwareNoError &&
+-        status != kAudioHardwareBadDeviceError) {
++    if (status != kAudioHardwareNoError) {
+         coreaudio_playback_logerr(status,
+-                                  "Could not start playback at init\n");
++                                  "Could not start playback at init");
++        if (core->rate_listener_installed) {
++            AudioObjectRemovePropertyListener(core->device_id,
++                                              &device_rate_addr,
++                                              handle_rate_change,
++                                              core);
++            core->rate_listener_installed = false;
++        }
++        OSStatus destroy_status = AudioDeviceDestroyIOProcID(
++            core->device_id, core->ioprocid);
++        if (destroy_status != kAudioHardwareNoError
++            && destroy_status != kAudioHardwareBadDeviceError) {
++            coreaudio_logerr(destroy_status,
++                             "Could not remove failed playback IOProc");
++        }
++        coreaudio_invalidate_bypass("CoreAudio device failed to start");
++        core->enabled = false;
++        core->ioprocid = NULL;
++        core->device_id = kAudioDeviceUnknown;
++        cdj3k_emu_active_output_device = kAudioDeviceUnknown;
++        atomic_store_explicit(&g_coreaudio_cached_samplerate, 0,
++                              memory_order_relaxed);
++        return status;
+     }
+ 
++    /* Publish only after AudioDeviceStart succeeds. A failed device must not
++     * make virtio-snd enable a bypass ring that no callback will drain. */
++    cdj3k_emu_active_output_device = device_id;
++
+     return 0;
+ }
+ 
+ static void fini_out_device(CoreaudioVoiceOut *core)
+ {
+     OSStatus status;
+-    UInt32 isrunning;
++    UInt32 isrunning = 0;
++
++    if (core->device_id == kAudioDeviceUnknown) {
++        return;
++    }
+ 
+     /* cdj3k-emu: detach the rate-change listener before tearing the device
+      * down. Errors here are diagnostic only - the device id is about to be
+      * invalidated either way. */
+-    if (core->device_id != kAudioDeviceUnknown) {
++    if (core->rate_listener_installed) {
+         OSStatus lst = AudioObjectRemovePropertyListener(core->device_id,
+                                                         &device_rate_addr,
+                                                         handle_rate_change,
+@@ -1098,6 +1371,7 @@ static void fini_out_device(CoreaudioVoiceOut *core)
+             coreaudio_logerr(lst,
+                              "Could not remove nominal-rate listener");
+         }
++        core->rate_listener_installed = false;
+     }
+ 
+     /* And invalidate any bypass that was riding on this device. */
+@@ -1126,6 +1400,8 @@ static void fini_out_device(CoreaudioVoiceOut *core)
+         coreaudio_logerr(status, "Could not remove IOProc");
+     }
+     core->device_id = kAudioDeviceUnknown;
++    core->ioprocid = NULL;
++    cdj3k_emu_active_output_device = kAudioDeviceUnknown;
+     /* Zero the samplerate cache so any virtio-snd read in the gap before
+      * the next init_out_device sees 0 (which makes the bypass gate refuse
+      * cleanly rather than miscomparing against a stale rate). */
+@@ -1133,41 +1409,6 @@ static void fini_out_device(CoreaudioVoiceOut *core)
+                           memory_order_relaxed);
+ }
+ 
+-static void update_out_device_playback_state(CoreaudioVoiceOut *core)
+-{
+-    OSStatus status;
+-    UInt32 isrunning;
+-
+-    status = coreaudio_get_out_isrunning(core->device_id, &isrunning);
+-    if (status != kAudioHardwareNoError) {
+-        if (status != kAudioHardwareBadObjectError) {
+-            coreaudio_logerr(status,
+-                             "Could not determine whether device is playing");
+-        }
+-
+-        return;
+-    }
+-
+-    if (core->enabled) {
+-        /* start playback */
+-        if (!isrunning) {
+-            status = AudioDeviceStart(core->device_id, core->ioprocid);
+-            if (status != kAudioHardwareBadDeviceError && status != kAudioHardwareNoError) {
+-                coreaudio_logerr(status, "Could not resume playback");
+-            }
+-        }
+-    } else {
+-        /* stop playback */
+-        if (isrunning) {
+-            status = AudioDeviceStop(core->device_id,
+-                                     core->ioprocid);
+-            if (status != kAudioHardwareBadDeviceError && status != kAudioHardwareNoError) {
+-                coreaudio_logerr(status, "Could not pause playback");
+-            }
+-        }
+-    }
+-}
+-
+ /* called without BQL. */
+ static OSStatus handle_voice_out_change(
+     AudioObjectID in_object_id,
+@@ -1193,10 +1434,6 @@ static OSStatus handle_voice_out_change(
+ 
+     init_out_device(core);
+ 
+-    if (core->device_id) {
+-        update_out_device_playback_state(core);
+-    }
+-
+     bql_unlock();
+     return 0;
+ }
+@@ -1223,9 +1460,6 @@ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as)
+     audio_pcm_init_info(&hw->info, as);
+     cdj3k_mixer_init(core);
+ 
+-    core->frame_size_setting = audio_buffer_frames(
+-        qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
+-
+     core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+ 
+     /* cdj3k-emu: capture the per-instance device UID (if the user picked one
+@@ -1247,6 +1481,7 @@ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as)
+         coreaudio_playback_logerr(status,
+                                   "Could not listen to voice property change");
+         cdj3k_mixer_fini(core);
++        pthread_mutex_destroy(&core->buf_mutex);
+         return -1;
+     }
+ 
+@@ -1260,6 +1495,7 @@ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as)
+                                       "Could not remove voice property change listener");
+         }
+         cdj3k_mixer_fini(core);
++        pthread_mutex_destroy(&core->buf_mutex);
+         return -1;
+     }
+ 

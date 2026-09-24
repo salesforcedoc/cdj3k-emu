@@ -42,6 +42,44 @@ pub fn instance_dir(id: u32) -> PathBuf {
     runtime_base_dir().join(format!("instance-{id}"))
 }
 
+/// Shared four-channel virtual-mixer control and meter state. Every emulator
+/// process for this user maps the same file.
+pub fn mixer_shm_path() -> PathBuf {
+    runtime_base_dir().join("mixer.shm")
+}
+
+/// Shared pre-DSP capture rings. The native mixer writes these without
+/// blocking; the player process that owns the Debug window drains its deck.
+pub fn capture_shm_path() -> PathBuf {
+    runtime_base_dir().join("capture.shm")
+}
+
+/// Advisory lock used to elect exactly one native mixer owner across all
+/// independently launched player applications.
+pub fn mixer_lock_path() -> PathBuf {
+    runtime_base_dir().join("mixer.lock")
+}
+
+/// Advisory lock electing the one process allowed to display the shared
+/// mixer viewport. Audio ownership uses a separate lock above.
+pub fn mixer_window_lock_path() -> PathBuf {
+    runtime_base_dir().join("mixer-window.lock")
+}
+
+/// Selected output-device UID for the singleton native mixer. An empty file
+/// means follow the current system default.
+pub fn mixer_device_path() -> PathBuf {
+    runtime_base_dir().join("mixer-device")
+}
+
+pub fn mixer_cue_device_path(bus: char) -> PathBuf {
+    runtime_base_dir().join(match bus {
+        'A' => "mixer-cue-a-device",
+        'B' => "mixer-cue-b-device",
+        _ => "mixer-cue-invalid-device",
+    })
+}
+
 /// Shared **DJPL** runtime socket dir (`/tmp/djpl-<UID>`, mode 0700). A
 /// product-NEUTRAL namespace shared with djx-emu so both emulators connect to
 /// the *same* socket_vmnet daemon → one DJ-Link L2 (players ↔ mixer see each

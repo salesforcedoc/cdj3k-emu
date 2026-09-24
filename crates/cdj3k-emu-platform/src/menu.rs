@@ -28,14 +28,19 @@ struct MenuState {
     service_item: CheckMenuItem,
     mods_item: CheckMenuItem,
     haptic_item: CheckMenuItem,
+    _midi_learn_item: MenuItem,
 
     // Audio
     latency_item: MenuItem,
     audio_item: CheckMenuItem,
+    reset_audio_item: MenuItem,
+    audio_latency_item: MenuItem,
     alc_item: CheckMenuItem,
 
     // Audio output device submenu (rebuilt when version changes)
     audio_device_submenu: Submenu,
+    cue_a_device_submenu: Submenu,
+    cue_b_device_submenu: Submenu,
     audio_device_version_seen: u32,
     /// Last time we re-enumerated CoreAudio devices. The menu thread polls
     /// every [`AUDIO_DEVICE_REFRESH_INTERVAL`] to catch hot-plug.
@@ -45,6 +50,7 @@ struct MenuState {
     jog_item: CheckMenuItem,
     main_item: CheckMenuItem,
     debug_item: CheckMenuItem,
+    mixer_item: CheckMenuItem,
 
     // Storage - eject_item is dynamically toggled; the others are ownership-
     // only to keep the muda Rc chain alive (click events still dispatch via
@@ -66,7 +72,7 @@ struct MenuState {
 }
 
 mod launch;
-use launch::{launch_instance, show_fda_alert, show_net_error_alert};
+use launch::{launch_instance, show_audio_error_alert, show_fda_alert, show_net_error_alert};
 
 thread_local! {
     static MENU_STATE: RefCell<Option<MenuState>> = RefCell::new(None);
@@ -90,6 +96,7 @@ pub fn setup_menu() {
     // Initial checked state is the runtime default (true); sync_menu() will
     // re-apply the persisted value once the UI has loaded InstanceSettings.
     let haptic_item = CheckMenuItem::with_id("haptic", "Jog Haptics", true, true, None);
+    let midi_learn_item = MenuItem::with_id("midi_learn", "MIDI Learn…", true, None);
 
     let emu_submenu = Submenu::with_items(
         "Emulation",
@@ -101,6 +108,7 @@ pub fn setup_menu() {
             &service_item,
             &mods_item,
             &haptic_item,
+            &midi_learn_item,
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::quit(None),
         ],
@@ -141,6 +149,8 @@ pub fn setup_menu() {
     // ── Audio submenu ────────────────────────────────────────────────────────
     let latency_item = MenuItem::new("Current Latency: -- ms", false, None);
     let audio_item = CheckMenuItem::with_id("audio", "Enable Audio", true, true, None);
+    let reset_audio_item = MenuItem::with_id("reset_audio", "Reset Audio", false, None);
+    let audio_latency_item = MenuItem::with_id("audio_latency", "Latency Profile…", true, None);
     let alc_item = CheckMenuItem::with_id("alc", "Enable ALC (Experimental)", true, false, None);
 
     // Output Device sub-submenu (populated immediately and rebuilt every time
@@ -149,6 +159,10 @@ pub fn setup_menu() {
     let audio_device_submenu = Submenu::new("Output Device", true);
     menu_state::refresh_audio_devices();
     build_audio_device_submenu(&audio_device_submenu);
+    let cue_a_device_submenu = Submenu::new("Cue A Output", true);
+    let cue_b_device_submenu = Submenu::new("Cue B Output", true);
+    build_cue_device_submenu(&cue_a_device_submenu, 'a');
+    build_cue_device_submenu(&cue_b_device_submenu, 'b');
 
     let audio_submenu = Submenu::with_items(
         "Audio",
@@ -157,9 +171,13 @@ pub fn setup_menu() {
             &latency_item,
             &PredefinedMenuItem::separator(),
             &audio_item,
+            &reset_audio_item,
+            &audio_latency_item,
             &alc_item,
             &PredefinedMenuItem::separator(),
             &audio_device_submenu,
+            &cue_a_device_submenu,
+            &cue_b_device_submenu,
         ],
     )
     .expect("build Audio submenu");
@@ -169,9 +187,14 @@ pub fn setup_menu() {
     let main_item =
         CheckMenuItem::with_id("main_screen", "External Main Screen", true, false, None);
     let debug_item = CheckMenuItem::with_id("debug_screen", "Debug Panel", true, false, None);
+    let mixer_item = CheckMenuItem::with_id("virtual_mixer", "Virtual Mixer", true, false, None);
 
-    let view_submenu = Submenu::with_items("View", true, &[&jog_item, &main_item, &debug_item])
-        .expect("build View submenu");
+    let view_submenu = Submenu::with_items(
+        "View",
+        true,
+        &[&mixer_item, &jog_item, &main_item, &debug_item],
+    )
+    .expect("build View submenu");
 
     // ── Instances submenu ────────────────────────────────────────────────────
     let inst_submenu = Submenu::new("Instances", true);
@@ -216,15 +239,21 @@ pub fn setup_menu() {
             service_item,
             mods_item,
             haptic_item,
+            _midi_learn_item: midi_learn_item,
             latency_item,
             audio_item,
+            reset_audio_item,
+            audio_latency_item,
             alc_item,
             audio_device_submenu,
+            cue_a_device_submenu,
+            cue_b_device_submenu,
             audio_device_version_seen: initial_audio_dev_ver,
             audio_device_last_refresh: Instant::now(),
             jog_item,
             main_item,
             debug_item,
+            mixer_item,
             eject_item,
             _create_item: create_item,
             _mount_item: mount_item,
@@ -252,6 +281,14 @@ pub fn sync_menu() {
     let net_err = menu_state::lock().net_error_message.take();
     if let Some(msg) = net_err {
         show_net_error_alert(&msg);
+    }
+
+    // Drop the state lock before opening the modal dialog. A reset can fail
+    // when the selected CoreAudio device disappeared or still rejects its
+    // stream format; the user can reconnect it and invoke Reset Audio again.
+    let audio_err = menu_state::lock().audio_error_message.take();
+    if let Some(msg) = audio_err {
+        show_audio_error_alert(&msg);
     }
 
     // ── Poll events ──────────────────────────────────────────────────────────
@@ -286,12 +323,15 @@ pub fn sync_menu() {
             jog_screen_popped: s.jog_screen_popped,
             main_screen_popped: s.main_screen_popped,
             debug_screen_popped: s.debug_screen_popped,
+            mixer_open: s.mixer_open,
             service_mode: s.service_mode,
             mods_enabled: s.mods_enabled,
             audio_enabled: s.audio_enabled,
+            qemu_running: s.qemu_running,
             alc_enabled: s.alc_enabled,
             haptic_enabled: s.haptic_enabled,
             latency_packed: s.latency_packed,
+            audio_latency_profile: s.audio_latency.profile,
             usb_virtual_mounted: s.usb_virtual_mounted,
             usb_phys_list_version: s.usb_phys_list_version,
             usb_phys_mounted_idx: s.usb_phys_mounted_idx,
@@ -309,12 +349,20 @@ pub fn sync_menu() {
         state.jog_item.set_checked(snap.jog_screen_popped);
         state.main_item.set_checked(snap.main_screen_popped);
         state.debug_item.set_checked(snap.debug_screen_popped);
+        state.mixer_item.set_checked(snap.mixer_open);
 
         // Emulation.
         state.service_item.set_checked(snap.service_mode);
         state.mods_item.set_checked(snap.mods_enabled);
         state.haptic_item.set_checked(snap.haptic_enabled);
         state.audio_item.set_checked(snap.audio_enabled);
+        state
+            .reset_audio_item
+            .set_enabled(snap.audio_enabled && snap.qemu_running);
+        state.audio_latency_item.set_text(format!(
+            "Latency Profile… ({})",
+            snap.audio_latency_profile.label()
+        ));
         state.alc_item.set_checked(snap.alc_enabled);
 
         // Latency label - driven by the cfg daemon's 3 s push.
@@ -360,15 +408,34 @@ pub fn sync_menu() {
         // rebuild the radio list iff the version actually changed.
         if state.audio_device_last_refresh.elapsed() >= AUDIO_DEVICE_REFRESH_INTERVAL {
             menu_state::refresh_audio_devices();
+            #[cfg(target_os = "macos")]
+            if let Ok(device_uid) = crate::native_mixer::requested_output_device() {
+                menu_state::lock().audio_device_uid = device_uid;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(device_uid) = crate::native_mixer::requested_cue_output_device('A') {
+                    menu_state::lock().cue_a_device_uid = device_uid;
+                }
+                if let Ok(device_uid) = crate::native_mixer::requested_cue_output_device('B') {
+                    menu_state::lock().cue_b_device_uid = device_uid;
+                }
+            }
             state.audio_device_last_refresh = Instant::now();
         }
         let live_audio_dev_ver = menu_state::lock().audio_device_list_version;
         if state.audio_device_version_seen != live_audio_dev_ver {
             clear_submenu(&state.audio_device_submenu);
             build_audio_device_submenu(&state.audio_device_submenu);
+            clear_submenu(&state.cue_a_device_submenu);
+            clear_submenu(&state.cue_b_device_submenu);
+            build_cue_device_submenu(&state.cue_a_device_submenu, 'a');
+            build_cue_device_submenu(&state.cue_b_device_submenu, 'b');
             state.audio_device_version_seen = live_audio_dev_ver;
         }
         sync_audio_device_checkmarks(&state.audio_device_submenu);
+        sync_cue_device_checkmarks(&state.cue_a_device_submenu, 'a');
+        sync_cue_device_checkmarks(&state.cue_b_device_submenu, 'b');
 
         // Instances.
         let cur = snap.current_instance_id;
@@ -399,12 +466,15 @@ struct MenuSnap {
     jog_screen_popped: bool,
     main_screen_popped: bool,
     debug_screen_popped: bool,
+    mixer_open: bool,
     service_mode: bool,
     mods_enabled: bool,
     audio_enabled: bool,
+    qemu_running: bool,
     alc_enabled: bool,
     haptic_enabled: bool,
     latency_packed: u64,
+    audio_latency_profile: menu_state::AudioLatencyProfile,
     usb_virtual_mounted: bool,
     usb_phys_list_version: u32,
     usb_phys_mounted_idx: i32,
@@ -419,6 +489,9 @@ fn handle_event(id: &str, pending_create: &mut bool, pending_mount: &mut bool) {
     match id {
         "install_firmware" => {
             s.firmware_wizard_requested = true;
+        }
+        "midi_learn" => {
+            s.midi_learn_requested = true;
         }
         "restart" => {
             s.shade_forced = true;
@@ -442,6 +515,12 @@ fn handle_event(id: &str, pending_create: &mut bool, pending_mount: &mut bool) {
             s.shade_forced = true;
             s.audio_toggle_requested = true;
         }
+        "reset_audio" => {
+            s.audio_reset_requested = true;
+        }
+        "audio_latency" => {
+            s.audio_latency_requested = true;
+        }
         "alc" => {
             s.alc_enabled = !s.alc_enabled;
             // Runtime worker consumes this and pushes
@@ -459,6 +538,7 @@ fn handle_event(id: &str, pending_create: &mut bool, pending_mount: &mut bool) {
         "jog_screen" => s.jog_screen_popped = !s.jog_screen_popped,
         "main_screen" => s.main_screen_popped = !s.main_screen_popped,
         "debug_screen" => s.debug_screen_popped = !s.debug_screen_popped,
+        "virtual_mixer" => s.mixer_open = !s.mixer_open,
         "net_none" => {
             if s.selected_interface != menu_state::NET_SEL_NONE {
                 s.shade_forced = true;
@@ -484,11 +564,34 @@ fn handle_event(id: &str, pending_create: &mut bool, pending_mount: &mut bool) {
             if s.audio_device_uid.is_some() {
                 s.audio_device_uid = None;
                 s.audio_device_toggle_requested = true;
-                s.shade_forced = true;
+            }
+        }
+        "cue_a_dev_off" => {
+            if s.cue_a_device_uid.take().is_some() {
+                s.cue_a_device_toggle_requested = true;
+            }
+        }
+        "cue_b_dev_off" => {
+            if s.cue_b_device_uid.take().is_some() {
+                s.cue_b_device_toggle_requested = true;
             }
         }
         other => {
-            if let Some(rest) = other.strip_prefix("audio_dev_uid_") {
+            if let Some(rest) = other.strip_prefix("cue_a_dev_uid_") {
+                if let Some(uid) = decode_hex_uid(rest) {
+                    if s.cue_a_device_uid.as_deref() != Some(uid.as_str()) {
+                        s.cue_a_device_uid = Some(uid);
+                        s.cue_a_device_toggle_requested = true;
+                    }
+                }
+            } else if let Some(rest) = other.strip_prefix("cue_b_dev_uid_") {
+                if let Some(uid) = decode_hex_uid(rest) {
+                    if s.cue_b_device_uid.as_deref() != Some(uid.as_str()) {
+                        s.cue_b_device_uid = Some(uid);
+                        s.cue_b_device_toggle_requested = true;
+                    }
+                }
+            } else if let Some(rest) = other.strip_prefix("audio_dev_uid_") {
                 // Decode the hex-encoded UID so identifier-unsafe chars in
                 // CoreAudio UIDs (':', spaces, etc.) survive the menu-id
                 // round-trip.
@@ -496,7 +599,6 @@ fn handle_event(id: &str, pending_create: &mut bool, pending_mount: &mut bool) {
                     if s.audio_device_uid.as_deref() != Some(uid.as_str()) {
                         s.audio_device_uid = Some(uid);
                         s.audio_device_toggle_requested = true;
-                        s.shade_forced = true;
                     }
                 }
             } else if let Some(rest) = other.strip_prefix("net_if_") {
@@ -531,8 +633,13 @@ fn handle_event(id: &str, pending_create: &mut bool, pending_mount: &mut bool) {
 
 fn build_net_submenu(submenu: &Submenu) {
     let none_item = CheckMenuItem::with_id("net_none", "Default (NAT)", true, true, None);
-    let host_item =
-        CheckMenuItem::with_id("net_vmnet_host", "Host-only (link-local)", true, false, None);
+    let host_item = CheckMenuItem::with_id(
+        "net_vmnet_host",
+        "Host-only (link-local)",
+        true,
+        false,
+        None,
+    );
     submenu.append(&none_item).ok();
     submenu.append(&host_item).ok();
 
@@ -612,6 +719,54 @@ fn build_audio_device_submenu(submenu: &Submenu) {
         let id = format!("audio_dev_uid_{}", encode_hex_uid(&dev.uid));
         let item = CheckMenuItem::with_id(id, label, true, false, None);
         submenu.append(&item).ok();
+    }
+}
+
+fn build_cue_device_submenu(submenu: &Submenu, bus: char) {
+    let off_id = format!("cue_{bus}_dev_off");
+    submenu
+        .append(&CheckMenuItem::with_id(off_id, "Off", true, true, None))
+        .ok();
+    let devs = menu_state::lock().audio_devices.clone();
+    if !devs.is_empty() {
+        submenu.append(&PredefinedMenuItem::separator()).ok();
+    }
+    for dev in devs {
+        let id = format!("cue_{bus}_dev_uid_{}", encode_hex_uid(&dev.uid));
+        let label = if dev.is_default {
+            format!("{} (system default)", dev.name)
+        } else {
+            dev.name
+        };
+        submenu
+            .append(&CheckMenuItem::with_id(id, label, true, false, None))
+            .ok();
+    }
+}
+
+fn sync_cue_device_checkmarks(submenu: &Submenu, bus: char) {
+    let state = menu_state::lock();
+    let selected = if bus == 'a' {
+        &state.cue_a_device_uid
+    } else {
+        &state.cue_b_device_uid
+    };
+    let present = selected
+        .as_ref()
+        .is_some_and(|uid| state.audio_devices.iter().any(|dev| &dev.uid == uid));
+    for item in submenu.items() {
+        let Some(check) = item.as_check_menuitem() else {
+            continue;
+        };
+        let id = check.id().0.as_str();
+        let checked = if id == format!("cue_{bus}_dev_off") {
+            selected.is_none() || !present
+        } else if let Some(encoded) = id.strip_prefix(&format!("cue_{bus}_dev_uid_")) {
+            decode_hex_uid(encoded).as_ref() == selected.as_ref() && present
+        } else {
+            false
+        };
+        check.set_checked(checked);
     }
 }
 

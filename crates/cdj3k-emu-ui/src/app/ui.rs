@@ -155,9 +155,30 @@ pub struct DebugSnapshot {
     pub main_fps: f32,
     pub main_shape_count: u64,
     pub jog_dbg_lines: [String; 3],
+    pub midi_jog_dbg_lines: [String; 4],
     pub lcd_touch: Option<(u16, u16)>,
     pub last_miso: [u8; cdj3k_emu_subucom::miso_frame::MISO_SIZE],
     pub led_frame: [u8; 64],
+    pub audio: AudioDebugSnapshot,
+    pub prolink: Option<cdj3k_emu_platform::menu_state::ProlinkTrackStatus>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct AudioDebugSnapshot {
+    pub reported_latency_ms: Option<(u32, u32, u32)>,
+    pub qemu_running: bool,
+    pub audio_enabled: bool,
+    pub external_ring_active: bool,
+    pub guest_rate_hz: u32,
+    pub transfer_frames: u32,
+    pub startup_prefill_frames: u32,
+    pub output_rate_hz: u32,
+    pub shared_ring_frames: usize,
+    pub shared_ring_target_frames: u32,
+    pub coreaudio_buffer_us: u32,
+    pub host_buffer_frames: u32,
+    pub host_safety_frames: u32,
+    pub host_device_frames: u32,
 }
 
 impl Default for DebugSnapshot {
@@ -167,16 +188,24 @@ impl Default for DebugSnapshot {
             main_fps: 60.0,
             main_shape_count: 0,
             jog_dbg_lines: [String::new(), String::new(), String::new()],
+            midi_jog_dbg_lines: [String::new(), String::new(), String::new(), String::new()],
             lcd_touch: None,
             last_miso: [0u8; cdj3k_emu_subucom::miso_frame::MISO_SIZE],
             led_frame: [0u8; 64],
+            audio: AudioDebugSnapshot::default(),
+            prolink: None,
         }
     }
 }
 
 /// Render the debug pane from a snapshot. `local_fps` is the fps measured
 /// inside the debug viewport's own update cycle (independent of `main_fps`).
-pub(super) fn draw_debug_content(ui: &mut egui::Ui, snap: &DebugSnapshot, local_fps: f32) {
+pub(super) fn draw_debug_content(
+    ui: &mut egui::Ui,
+    snap: &DebugSnapshot,
+    local_fps: f32,
+    capture: &cdj3k_emu_platform::audio_capture::AudioCaptureControl,
+) {
     let mono = egui::FontId::monospace(11.0);
 
     // ---- Status / FPS / shape count ----
@@ -190,9 +219,233 @@ pub(super) fn draw_debug_content(ui: &mut egui::Ui, snap: &DebugSnapshot, local_
     );
     ui.separator();
 
+    // ---- Pre-DSP audio capture ----
+    let capture_status = capture.status();
+    ui.horizontal(|ui| {
+        if capture_status.active {
+            if ui.button("Stop Capture").clicked() {
+                capture.stop();
+            }
+        } else if ui.button("Capture").clicked() {
+            if let Err(error) = capture.choose_and_start() {
+                eprintln!("cdj3k-emu: audio capture failed: {error}");
+            }
+        }
+        ui.label(
+            egui::RichText::new("deck input · pre trim / EQ / filter / fader")
+                .font(mono.clone())
+                .color(egui::Color32::GRAY),
+        );
+    });
+    if let Some(path) = &capture_status.path {
+        let state = if capture_status.active {
+            "recording"
+        } else {
+            "saved"
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "capture: {state}  {} Hz  {:.1}s  dropped={}  {}",
+                capture_status.sample_rate,
+                if capture_status.sample_rate == 0 {
+                    0.0
+                } else {
+                    capture_status.frames_written as f64 / capture_status.sample_rate as f64
+                },
+                capture_status.dropped_frames,
+                path.display(),
+            ))
+            .font(mono.clone()),
+        );
+    }
+    if let Some(error) = &capture_status.error {
+        ui.colored_label(egui::Color32::LIGHT_RED, format!("capture error: {error}"));
+    }
+    ui.separator();
+
+    // ---- Track state published by this player over Pro DJ Link ----
+    ui.label(
+        egui::RichText::new("track (Pro DJ Link)")
+            .font(mono.clone())
+            .strong(),
+    );
+    if let Some(track) = &snap.prolink {
+        let age_ms = track.received_at.elapsed().as_millis();
+        let freshness = if age_ms <= 1_000 { "live" } else { "stale" };
+        ui.label(
+            egui::RichText::new(format!(
+                "publisher: {}  player={}  ip={}  age={} ms ({})  firmware={}",
+                track.device_name,
+                track.player_number,
+                track.source_ip,
+                age_ms,
+                freshness,
+                track.firmware,
+            ))
+            .font(mono.clone()),
+        );
+        if track.source_player == 0 || track.source_slot == 0 || track.track_type == 0 {
+            ui.label(egui::RichText::new("loaded: none").font(mono.clone()));
+        } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "loaded: source-player={}  slot={}  type={}  rekordbox/track-id={}  list-track={}",
+                    track.source_player,
+                    prolink_slot_name(track.source_slot),
+                    prolink_track_type_name(track.track_type),
+                    track.track_id,
+                    track.track_number,
+                ))
+                .font(mono.clone()),
+            );
+        }
+        let pitch_ratio = track.pitch_raw as f64 / 0x10_0000 as f64;
+        let pitch_percent = (pitch_ratio - 1.0) * 100.0;
+        let bpm = (track.track_bpm_x100 != u16::MAX).then_some(track.track_bpm_x100 as f64 / 100.0);
+        let bpm_text = bpm
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "--".to_string());
+        let effective_bpm_text = bpm
+            .map(|value| format!("{:.2}", value * pitch_ratio))
+            .unwrap_or_else(|| "--".to_string());
+        ui.label(
+            egui::RichText::new(format!(
+                "transport: {}  track-bpm={}  pitch={:+.3}%  effective-bpm={}  beat={}  beat-in-bar={}",
+                prolink_play_state_name(track.play_state),
+                bpm_text,
+                pitch_percent,
+                effective_bpm_text,
+                track.beat_number,
+                track.beat_in_bar,
+            ))
+            .font(mono.clone()),
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "flags: play={}  master={}  sync={}  on-air={}  raw=0x{:02x}",
+                yes_no(track.state_flags & 0x40 != 0),
+                yes_no(track.state_flags & 0x20 != 0),
+                yes_no(track.state_flags & 0x10 != 0),
+                yes_no(track.state_flags & 0x08 != 0),
+                track.state_flags,
+            ))
+            .font(mono.clone()),
+        );
+        ui.label(
+            egui::RichText::new(
+                "note: title/artist/album are DB-server replies keyed by source + slot + track id; they are not present in the recurring status packet",
+            )
+            .font(mono.clone())
+            .color(egui::Color32::GRAY),
+        );
+    } else {
+        ui.label(
+            egui::RichText::new("waiting for this player to publish a CDJ status packet")
+                .font(mono.clone()),
+        );
+    }
+    ui.separator();
+
+    // ---- Audio pipeline latency ----
+    ui.label(
+        egui::RichText::new("audio latency")
+            .font(mono.clone())
+            .strong(),
+    );
+    let (transport, transport_color) = if !snap.audio.audio_enabled {
+        ("DISABLED", egui::Color32::GRAY)
+    } else if !snap.audio.qemu_running {
+        ("EMULATION STOPPED", egui::Color32::GRAY)
+    } else if snap.audio.external_ring_active {
+        ("SHARED NATIVE MIXER", egui::Color32::LIGHT_GREEN)
+    } else {
+        ("SHARED TRANSPORT UNAVAILABLE", egui::Color32::LIGHT_RED)
+    };
+    ui.label(
+        egui::RichText::new(format!("transport: {transport}"))
+            .font(mono.clone())
+            .strong()
+            .color(transport_color),
+    );
+    match snap.audio.reported_latency_ms {
+        Some((total, guest, host)) => ui.label(
+            egui::RichText::new(format!(
+                "reported: total={total} ms  guest-in-flight={guest} ms  host-extra={host} ms"
+            ))
+            .font(mono.clone()),
+        ),
+        None => ui
+            .label(egui::RichText::new("reported: waiting for guest telemetry").font(mono.clone())),
+    };
+    let guest_rate = snap.audio.guest_rate_hz.max(1);
+    ui.label(
+        egui::RichText::new(format!(
+            "guest: rate={} Hz  transfer={} f ({:.2} ms)  startup-prefill={} f ({:.2} ms)",
+            snap.audio.guest_rate_hz,
+            snap.audio.transfer_frames,
+            frames_to_ms(snap.audio.transfer_frames as usize, guest_rate),
+            snap.audio.startup_prefill_frames,
+            frames_to_ms(snap.audio.startup_prefill_frames as usize, guest_rate),
+        ))
+        .font(mono.clone()),
+    );
+    if snap.audio.output_rate_hz > 0 {
+        let requested_frames = (snap.audio.output_rate_hz as u64
+            * snap.audio.coreaudio_buffer_us as u64
+            / 1_000_000) as usize;
+        ui.label(
+            egui::RichText::new(format!(
+                "host: output={} Hz  shared-ring={} source-f ({:.2} ms), target={} f ({:.2} ms)  CoreAudio-request={} us (~{} f)",
+                snap.audio.output_rate_hz,
+                snap.audio.shared_ring_frames,
+                frames_to_ms(snap.audio.shared_ring_frames, snap.audio.guest_rate_hz),
+                snap.audio.shared_ring_target_frames,
+                frames_to_ms(
+                    snap.audio.shared_ring_target_frames as usize,
+                    snap.audio.guest_rate_hz,
+                ),
+                snap.audio.coreaudio_buffer_us,
+                requested_frames,
+            ))
+            .font(mono.clone()),
+        );
+    } else {
+        ui.label(egui::RichText::new("host: native output is not running").font(mono.clone()));
+    }
+    let native_frames = snap.audio.host_buffer_frames
+        + snap.audio.host_safety_frames
+        + snap.audio.host_device_frames;
+    ui.label(
+        egui::RichText::new(format!(
+            "native HAL: buffer={} f  safety={} f  device={} f  total={} f ({:.2} ms)",
+            snap.audio.host_buffer_frames,
+            snap.audio.host_safety_frames,
+            snap.audio.host_device_frames,
+            native_frames,
+            frames_to_ms(native_frames as usize, snap.audio.output_rate_hz),
+        ))
+        .font(mono.clone()),
+    );
+    ui.label(
+        egui::RichText::new(
+            "note: shared-ring depth is host-resident but overlaps guest-in-flight",
+        )
+        .font(mono.clone())
+        .color(egui::Color32::GRAY),
+    );
+    ui.separator();
+
     // ---- Jog kinematics ----
     ui.label(egui::RichText::new("jog").font(mono.clone()).strong());
     for line in &snap.jog_dbg_lines {
+        ui.label(egui::RichText::new(line).font(mono.clone()));
+    }
+    ui.label(
+        egui::RichText::new("midi jog inputs")
+            .font(mono.clone())
+            .strong(),
+    );
+    for line in &snap.midi_jog_dbg_lines {
         ui.label(egui::RichText::new(line).font(mono.clone()));
     }
     ui.separator();
@@ -276,15 +529,107 @@ pub(super) fn draw_debug_content(ui: &mut egui::Ui, snap: &DebugSnapshot, local_
 impl CdjApp {
     /// Builds a fresh [`DebugSnapshot`] from the current app state.
     pub(super) fn debug_snapshot(&self) -> DebugSnapshot {
+        let (instance_id, reported_latency_ms, tuning, qemu_running, audio_enabled, prolink) = {
+            let state = cdj3k_emu_platform::menu_state::lock();
+            (
+                state.current_instance_id,
+                cdj3k_emu_platform::menu_state::unpack_latency(state.latency_packed),
+                state.audio_latency.effective(),
+                state.qemu_running,
+                state.audio_enabled,
+                state.prolink_track_status.clone(),
+            )
+        };
+        let (
+            output_rate_hz,
+            guest_rate_hz,
+            shared_ring_frames,
+            shared_ring_target_frames,
+            coreaudio_buffer_us,
+            external_ring_active,
+            (host_buffer_frames, host_safety_frames, host_device_frames),
+        ) = self.mixer.audio_debug_stats(instance_id);
         DebugSnapshot {
             status: self.status.clone(),
             main_fps: self.fps_smooth,
             main_shape_count: self.frame_shape_count,
             jog_dbg_lines: self.jog_dbg_lines.clone(),
+            midi_jog_dbg_lines: self.midi_jog_debug_lines(),
             lcd_touch: self.lcd_touch,
             last_miso: self.last_miso,
             led_frame: self.led_state.frame,
+            prolink,
+            audio: AudioDebugSnapshot {
+                reported_latency_ms,
+                qemu_running,
+                audio_enabled,
+                external_ring_active,
+                guest_rate_hz,
+                transfer_frames: tuning.guest_transfer_frames,
+                startup_prefill_frames: tuning.startup_prefill_frames,
+                output_rate_hz,
+                shared_ring_frames,
+                shared_ring_target_frames,
+                coreaudio_buffer_us,
+                host_buffer_frames,
+                host_safety_frames,
+                host_device_frames,
+            },
         }
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn prolink_slot_name(slot: u8) -> &'static str {
+    match slot {
+        0 => "none",
+        1 => "CD",
+        2 => "SD",
+        3 => "USB",
+        4 => "rekordbox",
+        _ => "unknown",
+    }
+}
+
+fn prolink_track_type_name(track_type: u8) -> &'static str {
+    match track_type {
+        0 => "none",
+        1 => "rekordbox",
+        2 => "unanalyzed",
+        5 => "audio-CD",
+        _ => "unknown",
+    }
+}
+
+fn prolink_play_state_name(state: u8) -> &'static str {
+    match state {
+        0x00 => "no track",
+        0x02 => "loading",
+        0x03 => "playing",
+        0x04 => "looping",
+        0x05 => "paused",
+        0x06 => "cue paused",
+        0x07 => "cue play",
+        0x08 => "cue scratch",
+        0x09 => "searching",
+        0x0e => "CD idle",
+        0x11 => "ended",
+        _ => "unknown",
+    }
+}
+
+fn frames_to_ms(frames: usize, rate_hz: u32) -> f32 {
+    if rate_hz == 0 {
+        0.0
+    } else {
+        frames as f32 * 1000.0 / rate_hz as f32
     }
 }
 

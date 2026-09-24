@@ -98,6 +98,7 @@ impl CdjApp {
         let snapshot = Arc::clone(&self.debug_snapshot);
         let vp_state = Arc::clone(&self.debug_viewport_state);
         let wants_close = Arc::clone(&self.debug_wants_close);
+        let audio_capture = self.audio_capture.clone();
         // Live MOSI peek bypasses the snapshot path so debug shows real-time
         // wire bytes even when the main viewport's repaint filter is quiet.
         let live_mosi = self.ctrl_stream.latest_mosi_arc();
@@ -127,7 +128,7 @@ impl CdjApp {
                     )
                     .show(inner_ctx, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            ui::draw_debug_content(ui, &snap, local_fps);
+                            ui::draw_debug_content(ui, &snap, local_fps, &audio_capture);
                         });
                     });
 
@@ -156,7 +157,7 @@ impl CdjApp {
         let close_inner = close.clone();
         let mut popout_touch: Option<LcdTouchCapture> = None;
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("cdj_main_screen"),
+            main_screen_viewport_id(),
             egui::ViewportBuilder::default()
                 .with_title(format!(
                     "{} — Main Screen",
@@ -193,9 +194,13 @@ impl CdjApp {
             self.main_screen_popped = false;
         }
         if let Some(cap) = popout_touch {
-            self.apply_lcd_touch(cap);
+            self.apply_lcd_touch(cap, ctx);
         }
     }
+}
+
+pub(super) fn main_screen_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("cdj_main_screen")
 }
 
 /// Re-issue an `InnerSize` viewport command if the current size's aspect
@@ -255,6 +260,7 @@ fn capture_lcd_touch(ui: &mut egui::Ui, display_rect: egui::Rect) -> LcdTouchCap
         scroll_y: ui.input(|i| i.raw_scroll_delta.y),
         pointer_moved: ui.input(|i| i.pointer.delta().length_sq() > 0.0),
         is_down: lcd_resp.is_pointer_button_down_on(),
+        clicked: lcd_resp.clicked(),
         ctrl: ui.input(|i| i.modifiers.ctrl),
         right_down: ui.input(|i| {
             i.pointer.button_down(egui::PointerButton::Secondary)

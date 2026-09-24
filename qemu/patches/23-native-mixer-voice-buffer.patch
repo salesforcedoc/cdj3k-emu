@@ -1,0 +1,15 @@
+diff --git a/audio/coreaudio.m b/audio/coreaudio.m
+--- a/audio/coreaudio.m
++++ b/audio/coreaudio.m
+@@ -1531,6 +1531,11 @@ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as)
+      * native mixer owns the sole hardware output unit. */
+     extern int virtio_snd_external_ring_is_active(void);
+     if (virtio_snd_external_ring_is_active()) {
++        core->frame_size_setting = audio_buffer_frames(
++            qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
++        core->device_frame_size = core->frame_size_setting;
++        core->hw.samples = core->buffer_count * core->device_frame_size;
++        audio_generic_initialize_buffer_out(&core->hw);
+         core->device_id = kAudioDeviceUnknown;
+         core->ioprocid = NULL;
+         return 0;

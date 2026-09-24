@@ -24,7 +24,13 @@ impl CdjApp {
     /// On release edge without ctrl: clears `held_btn` and injects.
     /// On release edge with ctrl: moves the button into `latched_btns` and
     /// injects (button stays on until ctrl is released).
-    pub(super) fn handle_btn_interaction(&mut self, is_down: bool, ctrl: bool, btn: (usize, u8)) {
+    pub(super) fn handle_btn_interaction(
+        &mut self,
+        is_down: bool,
+        clicked: bool,
+        ctrl: bool,
+        btn: (usize, u8),
+    ) {
         let was_held = self.held_btn == Some(btn);
         if is_down && !was_held && !self.latched_btns.contains(&btn) {
             self.held_btn = Some(btn);
@@ -34,6 +40,14 @@ impl CdjApp {
             if ctrl {
                 self.latched_btns.insert(btn);
             }
+            self.inject(self.build_current_frame().finalize());
+        } else if clicked && !self.latched_btns.contains(&btn) {
+            // egui can deliver both pointer edges in one update when the UI
+            // thread was briefly preempted by low-latency audio work. In that
+            // case `is_pointer_button_down_on()` is already false even though
+            // this was a valid click. Publish a one-frame press now; the next
+            // repaint takes the normal release branch above.
+            self.held_btn = Some(btn);
             self.inject(self.build_current_frame().finalize());
         }
     }
@@ -62,8 +76,9 @@ impl CdjApp {
         let id = ui.id().with(&id_src);
         let response = ui.interact(rect, id, egui::Sense::click_and_drag());
         let is_down = response.is_pointer_button_down_on();
+        let clicked = response.clicked();
         let latched = self.latched_btns.contains(&btn);
-        let is_pressed = is_down || latched;
+        let is_pressed = is_down || latched || self.is_midi_button_pressed(btn);
 
         // State key: mix all LED-driven colors so any change invalidates the cache.
         let nudge_u32 = label_nudge
@@ -99,7 +114,10 @@ impl CdjApp {
         self.frame_shape_count += shapes.len() as u64;
         painter.extend(shapes.iter().cloned());
         let ctrl = ui.input(|i| i.modifiers.ctrl);
-        self.handle_btn_interaction(is_down, ctrl, btn);
+        self.handle_btn_interaction(is_down, clicked, ctrl, btn);
+        if clicked && !is_down {
+            ui.ctx().request_repaint_after(super::ANIM_REPAINT_INTERVAL);
+        }
     }
 
     /// Draw a circle button; inject on press edge, clear on release edge.
@@ -125,8 +143,9 @@ impl CdjApp {
         let rect = Rect::from_center_size(center, egui::Vec2::splat(radius * 2.0));
         let response = ui.interact(rect, id, egui::Sense::click_and_drag());
         let is_down = response.is_pointer_button_down_on();
+        let clicked = response.clicked();
         let latched = self.latched_btns.contains(&btn);
-        let is_pressed = is_down || latched;
+        let is_pressed = is_down || latched || self.is_midi_button_pressed(btn);
         let border = btn_border.unwrap_or_else(|| ui::default_circle_btn_border(layout));
 
         let state = btn_label_color.map_or(0u32, color_to_u32)
@@ -156,7 +175,10 @@ impl CdjApp {
         self.frame_shape_count += shapes.len() as u64;
         painter.extend(shapes.iter().cloned());
         let ctrl = ui.input(|i| i.modifiers.ctrl);
-        self.handle_btn_interaction(is_down, ctrl, btn);
+        self.handle_btn_interaction(is_down, clicked, ctrl, btn);
+        if clicked && !is_down {
+            ui.ctx().request_repaint_after(super::ANIM_REPAINT_INTERVAL);
+        }
     }
 
     /// Draw an arc-shaped button; inject on press edge, clear on release.
@@ -187,8 +209,9 @@ impl CdjApp {
         let id = ui.id().with(&id_src);
         let response = ui.interact(interact_rect, id, egui::Sense::click_and_drag());
         let is_down = response.is_pointer_button_down_on();
+        let clicked = response.clicked();
         let latched = self.latched_btns.contains(&btn);
-        let is_pressed = is_down || latched;
+        let is_pressed = is_down || latched || self.is_midi_button_pressed(btn);
 
         let state = color_to_u32(fill);
         let cache_key = ui::draw_cache::BtnCacheKey::new(
@@ -225,7 +248,10 @@ impl CdjApp {
         self.frame_shape_count += shapes.len() as u64;
         painter.extend(shapes.iter().cloned());
         let ctrl = ui.input(|i| i.modifiers.ctrl);
-        self.handle_btn_interaction(is_down, ctrl, btn);
+        self.handle_btn_interaction(is_down, clicked, ctrl, btn);
+        if clicked && !is_down {
+            ui.ctx().request_repaint_after(super::ANIM_REPAINT_INTERVAL);
+        }
     }
 }
 

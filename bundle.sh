@@ -32,7 +32,7 @@
 # Prerequisites:
 #   - qemu/install/lib/libcdj3k-emu-qemu.dylib  (from qemu/build.sh)
 #   - qemu/install/bin/qemu-img             (from qemu/build.sh)
-#   - build/initramfs-work/rootfs/lib/modules/*.ko  (from build.sh)
+#   - build/docker-out/modules/*.ko             (from build.sh)
 #   - guest/out/*_aarch64, guest/out/ep122_shim.so  (from build.sh)
 #
 # The script:
@@ -217,22 +217,23 @@ echo "     bundled socket_vmnet"
 # ── Resources: modules, patch scripts, guest tools, PPM assets ───────────────
 #
 # Prerequisites: build.sh must have been run first so that:
-#   build/initramfs-work/rootfs/lib/modules/*.ko  - pre-built kernel modules
-#   tools/*_aarch64, guest/out/ep122_shim.so            - pre-built guest tools
+#   build/docker-out/modules/*.ko       - pre-built kernel modules
+#   guest/out/*_aarch64 and ep122_shim.so - pre-built guest tools
 echo "==> Assembling Contents/Resources"
 
-ROOTFS_MODULES="$REPO_ROOT/build/initramfs-work/rootfs/lib/modules"
+BUILT_MODULES="$REPO_ROOT/build/docker-out/modules"
 RES_DIR="$RESOURCES_DIR"
 
 # guest/modules/
 RES_MODULES="$RES_DIR/modules"
 mkdir -p "$RES_MODULES"
-if [[ -d "$ROOTFS_MODULES" ]] && compgen -G "$ROOTFS_MODULES/*.ko" > /dev/null; then
-    cp "$ROOTFS_MODULES"/*.ko "$RES_MODULES/"
+if [[ -d "$BUILT_MODULES" ]] && compgen -G "$BUILT_MODULES/*.ko" > /dev/null; then
+    cp "$BUILT_MODULES"/*.ko "$RES_MODULES/"
     echo "     bundled $(ls "$RES_MODULES"/*.ko | wc -l | tr -d ' ') .ko files"
 else
-    echo "WARNING: no .ko files found at $ROOTFS_MODULES"
-    echo "         Run ./build.sh before bundling"
+    echo "ERROR: no .ko files found at $BUILT_MODULES" >&2
+    echo "       Run ./build.sh before bundling" >&2
+    exit 1
 fi
 
 # patch/   - single merged dispatcher + per-step assets

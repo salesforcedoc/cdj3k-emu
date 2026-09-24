@@ -244,7 +244,7 @@ impl FirmwareWizard {
         let log_height = ui.available_height() - 56.0; // leave room for bottom buttons
         Frame::default()
             .fill(Color32::from_rgb(14, 15, 17))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(40, 42, 48)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(40, 42, 48)))
             .rounding(Rounding::same(6.0))
             .inner_margin(Margin::same(6.0))
             .show(ui, |ui| {
@@ -340,7 +340,7 @@ impl FirmwareWizard {
     ) {
         Frame::default()
             .fill(fill)
-            .stroke(accent.map_or(Stroke::NONE, |c| Stroke::new(1.0, c)))
+            .stroke(accent.map_or(Stroke::NONE, |c| Stroke::new(1.0_f32, c)))
             .rounding(Rounding::same(6.0))
             .inner_margin(Margin::symmetric(10.0, 8.0))
             .show(ui, |ui| {

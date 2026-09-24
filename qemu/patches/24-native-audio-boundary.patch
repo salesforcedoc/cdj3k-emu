@@ -1,0 +1,2779 @@
+diff --git a/audio/coreaudio.m b/audio/coreaudio.m
+--- a/audio/coreaudio.m
++++ b/audio/coreaudio.m
+@@ -1,42 +1,25 @@
+ /*
+- * QEMU OS X CoreAudio audio driver
++ * cdj3k-emu transport-only audio backend.
+  *
+- * Copyright (c) 2005 Mike Kronenberg
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a copy
+- * of this software and associated documentation files (the "Software"), to deal
+- * in the Software without restriction, including without limitation the rights
+- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+- * copies of the Software, and to permit persons to whom the Software is
+- * furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice shall be included in
+- * all copies or substantial portions of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+- * THE SOFTWARE.
++ * The guest still needs a QEMU AudioState voice so virtio-sound can negotiate
++ * and schedule PCM transfers. Host device ownership, resampling, DSP,
++ * metering, latency measurement and reset policy all live in the singleton
++ * native mixer. This backend therefore only attaches the virtio-sound writer
++ * to the per-deck shared-memory ring; it never opens a CoreAudio device.
+  */
+ 
+ #include "qemu/osdep.h"
+-#include <CoreAudio/CoreAudio.h>
+-#include <mach/mach_time.h>      /* mach_absolute_time, mach_timebase_info */
+-#include <pthread.h>            /* pthread_X */
+-#include <stdatomic.h>           /* _Atomic */
+-#include <sys/mman.h>
+ #include <fcntl.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <sys/mman.h>
+ #include <unistd.h>
+ 
+-#include "qemu/main-loop.h"
+-#include "qemu/module.h"
+-#include "qemu/error-report.h"
++#include "audio_int.h"
+ #include "qemu/audio.h"
++#include "qemu/error-report.h"
++#include "qemu/module.h"
+ #include "qom/object.h"
+-#include "audio_int.h"
+ 
+ #define TYPE_AUDIO_COREAUDIO "audio-coreaudio"
+ OBJECT_DECLARE_SIMPLE_TYPE(AudioCoreaudio, AUDIO_COREAUDIO)
+@@ -46,15 +29,14 @@
+ };
+ 
+ #define CDJ3K_MIXER_MAGIC 0x31584d43u /* "CMX1" little-endian */
+-#define CDJ3K_MIXER_VERSION 3u
++#define CDJ3K_MIXER_VERSION 4u
+ #define CDJ3K_MIXER_CHANNELS 4u
+ #define CDJ3K_MIXER_HEADER_BYTES 64u
+ #define CDJ3K_MIXER_CHANNEL_BYTES 64u
+ #define CDJ3K_MIXER_RING_BYTES (128u * 1024u)
+ #define CDJ3K_MIXER_RING_BASE (CDJ3K_MIXER_HEADER_BYTES + \
+                                CDJ3K_MIXER_CHANNELS * CDJ3K_MIXER_CHANNEL_BYTES)
+-#define CDJ3K_MIXER_BYTES (CDJ3K_MIXER_HEADER_BYTES + \
+-                           CDJ3K_MIXER_CHANNELS * CDJ3K_MIXER_CHANNEL_BYTES + \
++#define CDJ3K_MIXER_BYTES (CDJ3K_MIXER_RING_BASE + \
+                            CDJ3K_MIXER_CHANNELS * CDJ3K_MIXER_RING_BYTES)
+ 
+ typedef struct Cdj3kMixerChannel {
+@@ -63,7 +45,8 @@
+     _Atomic uint64_t ring_head;
+     _Atomic uint64_t ring_tail;
+     _Atomic uint32_t ring_active;
+-    _Atomic uint32_t reserved[3];
++    _Atomic uint32_t source_rate;
++    _Atomic uint32_t reserved[2];
+ } Cdj3kMixerChannel;
+ 
+ _Static_assert(sizeof(Cdj3kMixerChannel) == CDJ3K_MIXER_CHANNEL_BYTES,
+@@ -72,443 +55,46 @@
+ typedef struct coreaudioVoiceOut {
+     HWVoiceOut hw;
+     pthread_mutex_t buf_mutex;
+-    AudioDeviceID device_id;
+-    int frame_size_setting;
+     uint32_t buffer_count;
+-    UInt32 device_frame_size;
+-    AudioDeviceIOProcID ioprocid;
+     bool enabled;
+     void *mixer_map;
+     size_t mixer_map_size;
+-    _Atomic uint32_t *mixer_crossfader;
+     Cdj3kMixerChannel *mixer_channel;
+-    int mixer_channel_index;
+-    float mixer_low_state[2];
+-    float mixer_high_state[2];
+-    float mixer_filter_state[2];
+-    float mixer_trim_gain;
+-    float mixer_high_gain;
+-    float mixer_mid_gain;
+-    float mixer_low_gain;
+-    float mixer_fader_gain;
+-    float mixer_crossfader_gain;
+-    float mixer_filter_alpha;
+-    int mixer_filter_mode;
+-    uint32_t mixer_control_cache[6];
+-    float mixer_coefficient_rate;
+-    float mixer_target_trim;
+-    float mixer_target_high;
+-    float mixer_target_mid;
+-    float mixer_target_low;
+-    float mixer_target_fader;
+-    float mixer_target_filter_alpha;
+-    float mixer_low_alpha;
+-    float mixer_high_alpha;
+-    int mixer_target_filter_mode;
+-    bool mixer_coefficients_valid;
+-    bool rate_listener_installed;
+ } CoreaudioVoiceOut;
+ 
+-/* AudioDeviceID currently bound by init_out_device. Used by the HAL
+- * rate-change listener (handle_rate_change) to query the right device's
+- * nominal sample rate without re-walking the property tree, and by
+- * coreaudio_get_active_samplerate() as the seed handle for the
+- * lock-free cache (see below). kAudioDeviceUnknown when no device is
+- * bound (between init and fini, or before first init). */
+-static AudioDeviceID cdj3k_emu_active_output_device = kAudioDeviceUnknown;
+-
+-/* cdj3k-emu: optional UID of a specific output device to bind to. When NULL,
+- * we fall back to kAudioHardwarePropertyDefaultOutputDevice (system default).
+- * Set per-instance via -audiodev coreaudio,out.device-uid=<UID>. The UI's
+- * per-instance "Output Device" picker resolves a CoreAudio UID and passes it
+- * through QemuConfig → cpdo->out_device_uid → here. */
+-static char *cdj3k_emu_preferred_device_uid = NULL;
+-
+-static const AudioObjectPropertyAddress voice_out_addr = {
+-    kAudioHardwarePropertyDefaultOutputDevice,
+-    kAudioObjectPropertyScopeGlobal,
+-    kAudioObjectPropertyElementMain
+-};
+-
+-/* Per-device property: nominal sample rate (what the HAL clock runs at).
+- * Used as both the read selector (to seed the cached samplerate) and
+- * the listener selector (to refresh the cache when the HAL rate changes
+- * - e.g. user opens Audio MIDI Setup, Audio Hijack flips the rate
+- * underneath us, Bluetooth renegotiates). The listener does NOT
+- * invalidate the bypass anymore: the writer's resampler tracks
+- * (potentially changing) HAL rates through the soft-PLL, so a brief
+- * rate mismatch becomes a sub-perceptual pitch nudge instead of an
+- * audible mixer-resampler fallback. */
+-static const AudioObjectPropertyAddress device_rate_addr = {
+-    kAudioDevicePropertyNominalSampleRate,
+-    kAudioObjectPropertyScopeGlobal,
+-    kAudioObjectPropertyElementMain
+-};
+-
+-static const AudioObjectPropertyAddress out_stream_format_addr = {
+-    kAudioDevicePropertyStreamFormat,
+-    kAudioDevicePropertyScopeOutput,
+-    kAudioObjectPropertyElementMain
+-};
+-
+-static const AudioObjectPropertyAddress out_frame_size_addr = {
+-    kAudioDevicePropertyBufferFrameSize,
+-    kAudioDevicePropertyScopeOutput,
+-    kAudioObjectPropertyElementMain
+-};
+-
+-static OSStatus coreaudio_get_out_streamformat(
+-    AudioDeviceID id, AudioStreamBasicDescription *description)
++static int coreaudio_voice_out_buf_lock(CoreaudioVoiceOut *core,
++                                        const char *fn_name)
+ {
+-    UInt32 size = sizeof(*description);
+-
+-    return AudioObjectGetPropertyData(id,
+-                                      &out_stream_format_addr,
+-                                      0,
+-                                      NULL,
+-                                      &size,
+-                                      description);
+-}
+-
+-/* Resolve a CoreAudio device UID to its AudioDeviceID. Returns
+- * kAudioDeviceUnknown if the UID doesn't match any live device. */
+-static AudioDeviceID coreaudio_resolve_uid(const char *uid_cstr)
+-{
+-    if (!uid_cstr || !uid_cstr[0]) {
+-        return kAudioDeviceUnknown;
++    int err = pthread_mutex_lock(&core->buf_mutex);
++    if (err) {
++        error_report("coreaudio transport: could not lock voice for %s: %s",
++                     fn_name, strerror(err));
++        return -1;
+     }
+-    CFStringRef uid = CFStringCreateWithCString(NULL, uid_cstr,
+-                                                kCFStringEncodingUTF8);
+-    if (!uid) {
+-        return kAudioDeviceUnknown;
+-    }
+-    AudioObjectPropertyAddress addr = {
+-        kAudioHardwarePropertyTranslateUIDToDevice,
+-        kAudioObjectPropertyScopeGlobal,
+-        kAudioObjectPropertyElementMain
+-    };
+-    AudioDeviceID resolved = kAudioDeviceUnknown;
+-    UInt32 sz = sizeof(resolved);
+-    OSStatus st = AudioObjectGetPropertyData(kAudioObjectSystemObject,
+-                                             &addr,
+-                                             sizeof(uid), &uid,
+-                                             &sz, &resolved);
+-    CFRelease(uid);
+-    if (st != kAudioHardwareNoError) {
+-        return kAudioDeviceUnknown;
+-    }
+-    return resolved;
++    return 0;
+ }
+ 
+-static OSStatus coreaudio_get_voice_out(AudioDeviceID *id)
++static int coreaudio_voice_out_buf_unlock(CoreaudioVoiceOut *core,
++                                          const char *fn_name)
+ {
+-    UInt32 size = sizeof(*id);
+-
+-    /* Per-instance device pick wins over system default when its UID
+-     * still resolves; otherwise we fall through to the default and log
+-     * once so the user knows we couldn't honor their choice. */
+-    if (cdj3k_emu_preferred_device_uid) {
+-        AudioDeviceID r = coreaudio_resolve_uid(cdj3k_emu_preferred_device_uid);
+-        if (r != kAudioDeviceUnknown) {
+-            *id = r;
+-            return kAudioHardwareNoError;
+-        }
+-        fprintf(stderr,
+-                "coreaudio: preferred device UID '%s' not present - "
+-                "falling back to system default output\n",
+-                cdj3k_emu_preferred_device_uid);
+-    }
+-
+-    return AudioObjectGetPropertyData(kAudioObjectSystemObject,
+-                                      &voice_out_addr,
+-                                      0,
+-                                      NULL,
+-                                      &size,
+-                                      id);
+-}
+-
+-static OSStatus coreaudio_get_out_framesizerange(AudioDeviceID id,
+-                                                 AudioValueRange *framerange)
+-{
+-    UInt32 size = sizeof(*framerange);
+-    AudioObjectPropertyAddress addr = {
+-        kAudioDevicePropertyBufferFrameSizeRange,
+-        kAudioDevicePropertyScopeOutput,
+-        kAudioObjectPropertyElementMain
+-    };
+-
+-    return AudioObjectGetPropertyData(id,
+-                                      &addr,
+-                                      0,
+-                                      NULL,
+-                                      &size,
+-                                      framerange);
+-}
+-
+-static OSStatus coreaudio_get_out_framesize(AudioDeviceID id, UInt32 *framesize)
+-{
+-    UInt32 size = sizeof(*framesize);
+-
+-    return AudioObjectGetPropertyData(id,
+-                                      &out_frame_size_addr,
+-                                      0,
+-                                      NULL,
+-                                      &size,
+-                                      framesize);
+-}
+-
+-static OSStatus coreaudio_set_out_framesize(AudioDeviceID id, UInt32 *framesize)
+-{
+-    UInt32 size = sizeof(*framesize);
+-
+-    return AudioObjectSetPropertyData(id,
+-                                      &out_frame_size_addr,
+-                                      0,
+-                                      NULL,
+-                                      size,
+-                                      framesize);
+-}
+-
+-/* HAL output pipeline depth in microseconds. Updated by audioDeviceIOProc
+- * from inOutputTime->mHostTime - mach_absolute_time(). Reflects the time
+- * between when IOProc fills a buffer and when the DAC will play it -
+- * i.e. the CoreAudio HAL output queue depth. Read by virtio-snd to
+- * expose to the guest via config space. */
+-static _Atomic uint32_t g_coreaudio_pipeline_depth_us;
+-
+-uint32_t coreaudio_get_pipeline_depth_us(void);
+-uint32_t coreaudio_get_pipeline_depth_us(void)
+-{
+-    return atomic_load_explicit(&g_coreaudio_pipeline_depth_us,
+-                                memory_order_relaxed);
+-}
+-
+-/* Static device latency in frames: kAudioDevicePropertyLatency +
+- * kAudioDevicePropertySafetyOffset. Captures the USB transit + DAC
+- * pipeline (Focusrite, etc.) - typically 10-30ms on USB interfaces.
+- * Added to the dynamic HAL depth to get the full host audio latency. */
+-static _Atomic uint32_t g_coreaudio_static_latency_frames;
+-
+-uint32_t coreaudio_get_static_latency_frames(void);
+-uint32_t coreaudio_get_static_latency_frames(void)
+-{
+-    return atomic_load_explicit(&g_coreaudio_static_latency_frames,
+-                                memory_order_relaxed);
+-}
+-
+-/* cdj3k-emu: cached current output-stream sample rate of the bound device.
+- * The original implementation issued a synchronous HAL property read on
+- * every call. Because the guest pulls virtio-snd config (and thus this
+- * value, via virtio_snd_bypass_depth_frames) from a sysfs polling loop,
+- * those reads landed on the BQL thread under contention - each one
+- * 100-500 us nominal, occasionally several ms when coreaudiod is busy -
+- * and starved the bypass-ring refill cadence, producing audible pops.
+- * Now this is a single atomic load: the value is seeded by
+- * init_out_device and kept fresh by the rate-change HAL listener
+- * (handle_rate_change), which fires off-BQL. */
+-static _Atomic uint32_t g_coreaudio_cached_samplerate;
+-
+-/* Re-query the device's output-stream rate and update the cache. Safe to call
+- * from any thread: AudioObjectGetPropertyData is thread-safe and the
+- * cache write is a single atomic store. Returns the rate it stored, or
+- * 0 if the read failed (in which case the cache is also zeroed). */
+-static unsigned coreaudio_refresh_cached_samplerate(AudioDeviceID device_id)
+-{
+-    if (device_id == kAudioDeviceUnknown) {
+-        atomic_store_explicit(&g_coreaudio_cached_samplerate, 0,
+-                              memory_order_relaxed);
+-        return 0;
+-    }
+-    AudioStreamBasicDescription stream_format = { 0 };
+-    Float64 rate = 0;
+-    OSStatus status = coreaudio_get_out_streamformat(device_id,
+-                                                     &stream_format);
+-
+-    /* The virtual stream's rate is the clock seen by the IOProc. It can
+-     * differ from the device's nominal rate on aggregate and loopback
+-     * devices, so prefer it for resampling, mixer coefficients and latency
+-     * accounting. Fall back to the nominal rate only when the stream does
+-     * not expose a usable value. */
+-    if (status == kAudioHardwareNoError && stream_format.mSampleRate > 0) {
+-        rate = stream_format.mSampleRate;
+-    } else {
+-        UInt32 size = sizeof(rate);
+-        status = AudioObjectGetPropertyData(device_id, &device_rate_addr,
+-                                            0, NULL, &size, &rate);
+-    }
+-    unsigned u = (status == kAudioHardwareNoError && rate > 0)
+-                     ? (unsigned)(rate + 0.5) : 0;
+-    atomic_store_explicit(&g_coreaudio_cached_samplerate, u,
+-                          memory_order_relaxed);
+-    return u;
+-}
+-
+-/* Hot-path accessor. Used by virtio-snd's config-read path (every guest
+- * sysfs poll). Must be lock-free and syscall-free - see comment above. */
+-unsigned coreaudio_get_active_samplerate(void);
+-unsigned coreaudio_get_active_samplerate(void)
+-{
+-    return atomic_load_explicit(&g_coreaudio_cached_samplerate,
+-                                memory_order_relaxed);
+-}
+-
+-static OSStatus coreaudio_set_out_streamformat(AudioDeviceID id,
+-                                               AudioStreamBasicDescription *d)
+-{
+-    UInt32 size = sizeof(*d);
+-
+-    return AudioObjectSetPropertyData(id,
+-                                      &out_stream_format_addr,
+-                                      0,
+-                                      NULL,
+-                                      size,
+-                                      d);
+-}
+-
+-static OSStatus coreaudio_get_out_isrunning(AudioDeviceID id, UInt32 *result)
+-{
+-    UInt32 size = sizeof(*result);
+-    AudioObjectPropertyAddress addr = {
+-        kAudioDevicePropertyDeviceIsRunning,
+-        kAudioDevicePropertyScopeOutput,
+-        kAudioObjectPropertyElementMain
+-    };
+-
+-    return AudioObjectGetPropertyData(id,
+-                                      &addr,
+-                                      0,
+-                                      NULL,
+-                                      &size,
+-                                      result);
+-}
+-
+-static void coreaudio_logstatus(OSStatus status)
+-{
+-    const char *str = "BUG";
+-
+-    switch (status) {
+-    case kAudioHardwareNoError:
+-        str = "kAudioHardwareNoError";
+-        break;
+-
+-    case kAudioHardwareNotRunningError:
+-        str = "kAudioHardwareNotRunningError";
+-        break;
+-
+-    case kAudioHardwareUnspecifiedError:
+-        str = "kAudioHardwareUnspecifiedError";
+-        break;
+-
+-    case kAudioHardwareUnknownPropertyError:
+-        str = "kAudioHardwareUnknownPropertyError";
+-        break;
+-
+-    case kAudioHardwareBadPropertySizeError:
+-        str = "kAudioHardwareBadPropertySizeError";
+-        break;
+-
+-    case kAudioHardwareIllegalOperationError:
+-        str = "kAudioHardwareIllegalOperationError";
+-        break;
+-
+-    case kAudioHardwareBadDeviceError:
+-        str = "kAudioHardwareBadDeviceError";
+-        break;
+-
+-    case kAudioHardwareBadStreamError:
+-        str = "kAudioHardwareBadStreamError";
+-        break;
+-
+-    case kAudioHardwareUnsupportedOperationError:
+-        str = "kAudioHardwareUnsupportedOperationError";
+-        break;
+-
+-    case kAudioDeviceUnsupportedFormatError:
+-        str = "kAudioDeviceUnsupportedFormatError";
+-        break;
+-
+-    case kAudioDevicePermissionsError:
+-        str = "kAudioDevicePermissionsError";
+-        break;
+-
+-    default:
+-        error_printf(" Reason: status code %" PRId32, (int32_t)status);
+-        return;
+-    }
+-
+-    error_printf(" Reason: %s", str);
+-}
+-
+-static void G_GNUC_PRINTF(2, 3) coreaudio_logerr(OSStatus status,
+-                                                const char *fmt, ...)
+-{
+-    va_list ap;
+-
+-    error_printf("coreaudio: ");
+-    va_start(ap, fmt);
+-    error_vprintf(fmt, ap);
+-    va_end(ap);
+-    coreaudio_logstatus(status);
+-    error_printf("\n");
+-}
+-
+-static void G_GNUC_PRINTF(3, 4) coreaudio_logerr2(OSStatus status,
+-                                                  const char *typ,
+-                                                  const char *fmt, ...)
+-{
+-    va_list ap;
+-
+-    error_printf("coreaudio: Could not initialize %s: ", typ);
+-    va_start(ap, fmt);
+-    error_vprintf(fmt, ap);
+-    va_end(ap);
+-    coreaudio_logstatus(status);
+-    error_printf("\n");
+-}
+-
+-#define coreaudio_playback_logerr(status, ...) \
+-    coreaudio_logerr2(status, "playback", __VA_ARGS__)
+-
+-static int coreaudio_voice_out_buf_lock(CoreaudioVoiceOut *core,
+-                                        const char *fn_name)
+-{
+-    int err;
+-
+-    err = pthread_mutex_lock(&core->buf_mutex);
+-    if (err) {
+-        error_report("coreaudio: Could not lock voice for %s: %s",
++    int err = pthread_mutex_unlock(&core->buf_mutex);
++    if (err) {
++        error_report("coreaudio transport: could not unlock voice for %s: %s",
+                      fn_name, strerror(err));
+         return -1;
+     }
+     return 0;
+ }
+ 
+-static int coreaudio_voice_out_buf_unlock(CoreaudioVoiceOut *core,
+-                                          const char *fn_name)
+-{
+-    int err;
+-
+-    err = pthread_mutex_unlock(&core->buf_mutex);
+-    if (err) {
+-        error_report("coreaudio: Could not unlock voice for %s: %s",
+-                     fn_name, strerror(err));
+-        return -1;
+-    }
+-    return 0;
+-}
+-
+ #define COREAUDIO_WRAPPER_FUNC(name, ret_type, args_decl, args)       \
+     static ret_type glue(coreaudio_, name)args_decl                   \
+     {                                                                 \
+         CoreaudioVoiceOut *core = (CoreaudioVoiceOut *)hw;            \
+         ret_type ret;                                                 \
+-                                                                      \
+         if (coreaudio_voice_out_buf_lock(core, "coreaudio_" #name)) { \
+             return 0;                                                 \
+         }                                                             \
+-                                                                      \
+         ret = glue(audio_generic_, name)args;                         \
+-                                                                      \
+         coreaudio_voice_out_buf_unlock(core, "coreaudio_" #name);     \
+         return ret;                                                   \
+     }
+@@ -518,297 +104,73 @@
+ COREAUDIO_WRAPPER_FUNC(put_buffer_out, size_t,
+                        (HWVoiceOut *hw, void *buf, size_t size),
+                        (hw, buf, size))
+-COREAUDIO_WRAPPER_FUNC(write, size_t, (HWVoiceOut *hw, void *buf, size_t size),
++COREAUDIO_WRAPPER_FUNC(write, size_t,
++                       (HWVoiceOut *hw, void *buf, size_t size),
+                        (hw, buf, size))
+ #undef COREAUDIO_WRAPPER_FUNC
+ 
+-static uint32_t cdj3k_mixer_control(_Atomic uint32_t *value)
+-{
+-    uint32_t raw = atomic_load_explicit(value, memory_order_relaxed);
+-    return MIN(raw, 1000u);
+-}
+-
+-static float cdj3k_mixer_norm(uint32_t value)
+-{
+-    return value / 1000.0f;
+-}
+-
+-static float cdj3k_mixer_eq_gain(float value)
+-{
+-    float db = value <= 0.5f
+-        ? -26.0f + value * 52.0f
+-        : (value - 0.5f) * 12.0f;
+-    return powf(10.0f, db / 20.0f);
+-}
+-
+-static float cdj3k_mixer_alpha(float cutoff, float sample_rate)
+-{
+-    if (sample_rate <= 0.0f) {
+-        return 1.0f;
+-    }
+-    return 1.0f - expf(-2.0f * (float)M_PI * cutoff / sample_rate);
+-}
+-
+-/* Recompute transcendental mixer coefficients only when a control or the
+- * live HAL stream rate changes. The per-buffer ramps below still run on every
+- * callback, preserving the existing click-free control response. */
+-static void cdj3k_mixer_update_coefficients(CoreaudioVoiceOut *core,
+-                                            Cdj3kMixerChannel *channel,
+-                                            float sample_rate)
+-{
+-    uint32_t control[6];
+-
+-    for (size_t i = 0; i < ARRAY_SIZE(control); i++) {
+-        control[i] = cdj3k_mixer_control(&channel->control[i]);
+-    }
+-    if (core->mixer_coefficients_valid
+-        && core->mixer_coefficient_rate == sample_rate
+-        && memcmp(control, core->mixer_control_cache,
+-                  sizeof(control)) == 0) {
+-        return;
+-    }
+-
+-    float trim = cdj3k_mixer_norm(control[0]);
+-    float high = cdj3k_mixer_norm(control[1]);
+-    float mid = cdj3k_mixer_norm(control[2]);
+-    float low = cdj3k_mixer_norm(control[3]);
+-    float filter = cdj3k_mixer_norm(control[4]);
+-    float fader = cdj3k_mixer_norm(control[5]);
+-    float target_filter_alpha = core->mixer_filter_alpha;
+-    int target_filter_mode = 0;
+-
+-    core->mixer_target_trim =
+-        powf(10.0f, ((trim - 0.5f) * 24.0f) / 20.0f);
+-    core->mixer_target_high = cdj3k_mixer_eq_gain(high);
+-    core->mixer_target_mid = cdj3k_mixer_eq_gain(mid);
+-    core->mixer_target_low = cdj3k_mixer_eq_gain(low);
+-    core->mixer_target_fader = fader * fader * fader;
+-
+-    if (filter < 0.48f) {
+-        float position = filter / 0.48f;
+-        float cutoff = 80.0f * powf(18000.0f / 80.0f, position);
+-        target_filter_alpha = cdj3k_mixer_alpha(cutoff, sample_rate);
+-        target_filter_mode = -1; /* low-pass */
+-    } else if (filter > 0.52f) {
+-        float position = (filter - 0.52f) / 0.48f;
+-        float cutoff = 20.0f * powf(10000.0f / 20.0f, position);
+-        target_filter_alpha = cdj3k_mixer_alpha(cutoff, sample_rate);
+-        target_filter_mode = 1; /* high-pass */
+-    }
+-
+-    core->mixer_target_filter_alpha = target_filter_alpha;
+-    core->mixer_target_filter_mode = target_filter_mode;
+-    core->mixer_low_alpha = cdj3k_mixer_alpha(250.0f, sample_rate);
+-    core->mixer_high_alpha = cdj3k_mixer_alpha(4000.0f, sample_rate);
+-    memcpy(core->mixer_control_cache, control, sizeof(control));
+-    core->mixer_coefficient_rate = sample_rate;
+-    core->mixer_coefficients_valid = true;
+-}
+-
+-static void cdj3k_mixer_publish_silence(CoreaudioVoiceOut *core)
+-{
+-    if (!core->mixer_channel) {
+-        return;
+-    }
+-    atomic_store_explicit(&core->mixer_channel->peak[0], 0,
+-                          memory_order_relaxed);
+-    atomic_store_explicit(&core->mixer_channel->peak[1], 0,
+-                          memory_order_relaxed);
+-}
+-
+-/* Encode a true peak into the UI's -60 dB .. +12 dB meter range. Keeping
+- * this pre-clipping lets the red +12 dB segment report overloads that the
+- * output safety clamp would otherwise hide. */
+-static uint32_t cdj3k_mixer_peak_raw(float linear)
+-{
+-    if (linear <= 0.001f) {
+-        return 0;
+-    }
+-    float db = 20.0f * log10f(linear);
+-    float normalized = (MAX(-60.0f, MIN(12.0f, db)) + 60.0f) / 72.0f;
+-    return (uint32_t)(normalized * 1000.0f);
+-}
+-
+-/* Apply the current channel strip directly to QEMU's float32 interleaved
+- * output. CoreAudio then sums the independently-running player processes on
+- * their common output device, producing the virtual four-channel mixer. */
+-static void cdj3k_mixer_process(CoreaudioVoiceOut *core, void *buffer,
+-                                UInt32 frames)
+-{
+-    Cdj3kMixerChannel *channel = core->mixer_channel;
+-    unsigned channels = core->hw.info.nchannels;
+-    float sample_rate = coreaudio_get_active_samplerate();
+-    float *samples = buffer;
+-    float peak[2] = { 0.0f, 0.0f };
+-
+-    if (!channel || !buffer || !frames || !channels) {
+-        return;
+-    }
+-
+-    if (sample_rate <= 0.0f) {
+-        sample_rate = core->hw.info.freq;
+-    }
+-    cdj3k_mixer_update_coefficients(core, channel, sample_rate);
+-
+-    float crossfader = cdj3k_mixer_norm(atomic_load_explicit(
+-        core->mixer_crossfader, memory_order_relaxed));
+-    /* DJ-style center: both sides are unity at the midpoint. Channels 1-2
+-     * are fixed to A and channels 3-4 to B until assign switches are added. */
+-    float target_crossfader = core->mixer_channel_index < 2
+-        ? MIN(1.0f, (1.0f - crossfader) * 2.0f)
+-        : MIN(1.0f, crossfader * 2.0f);
+-
+-    float inv_frames = 1.0f / frames;
+-    float trim_step = (core->mixer_target_trim - core->mixer_trim_gain)
+-                      * inv_frames;
+-    float high_step = (core->mixer_target_high - core->mixer_high_gain)
+-                      * inv_frames;
+-    float mid_step = (core->mixer_target_mid - core->mixer_mid_gain)
+-                     * inv_frames;
+-    float low_step = (core->mixer_target_low - core->mixer_low_gain)
+-                     * inv_frames;
+-    float fader_step = (core->mixer_target_fader - core->mixer_fader_gain)
+-                       * inv_frames;
+-    float crossfader_step = (target_crossfader
+-                             - core->mixer_crossfader_gain) * inv_frames;
+-    float filter_step = (core->mixer_target_filter_alpha
+-                         - core->mixer_filter_alpha) * inv_frames;
+-
+-    core->mixer_filter_mode = core->mixer_target_filter_mode;
+-    for (UInt32 frame = 0; frame < frames; frame++) {
+-        core->mixer_trim_gain += trim_step;
+-        core->mixer_high_gain += high_step;
+-        core->mixer_mid_gain += mid_step;
+-        core->mixer_low_gain += low_step;
+-        core->mixer_fader_gain += fader_step;
+-        core->mixer_crossfader_gain += crossfader_step;
+-        core->mixer_filter_alpha += filter_step;
+-
+-        for (unsigned stream = 0; stream < channels; stream++) {
+-            unsigned state = MIN(stream, 1u);
+-            size_t index = (size_t)frame * channels + stream;
+-            float input = samples[index];
+-
+-            core->mixer_low_state[state] += core->mixer_low_alpha
+-                * (input - core->mixer_low_state[state]);
+-            core->mixer_high_state[state] += core->mixer_high_alpha
+-                * (input - core->mixer_high_state[state]);
+-            float low_band = core->mixer_low_state[state];
+-            float mid_band = core->mixer_high_state[state] - low_band;
+-            float high_band = input - core->mixer_high_state[state];
+-            float output = low_band * core->mixer_low_gain
+-                         + mid_band * core->mixer_mid_gain
+-                         + high_band * core->mixer_high_gain;
+-            output *= core->mixer_trim_gain;
+-            float meter_sample = output;
+-
+-            if (core->mixer_filter_mode == 0) {
+-                core->mixer_filter_state[state] = output;
+-            } else {
+-                core->mixer_filter_state[state] += core->mixer_filter_alpha
+-                    * (output - core->mixer_filter_state[state]);
+-                output = core->mixer_filter_mode < 0
+-                    ? core->mixer_filter_state[state]
+-                    : output - core->mixer_filter_state[state];
+-            }
+-            output *= core->mixer_fader_gain * core->mixer_crossfader_gain;
+-            output = MAX(-1.0f, MIN(1.0f, output));
+-            samples[index] = output;
+-            peak[state] = MAX(peak[state], fabsf(meter_sample));
+-        }
+-    }
+-
+-    core->mixer_trim_gain = core->mixer_target_trim;
+-    core->mixer_high_gain = core->mixer_target_high;
+-    core->mixer_mid_gain = core->mixer_target_mid;
+-    core->mixer_low_gain = core->mixer_target_low;
+-    core->mixer_fader_gain = core->mixer_target_fader;
+-    core->mixer_crossfader_gain = target_crossfader;
+-    core->mixer_filter_alpha = core->mixer_target_filter_alpha;
+-    if (channels == 1) {
+-        peak[1] = peak[0];
+-    }
+-    atomic_store_explicit(&channel->peak[0],
+-                          cdj3k_mixer_peak_raw(peak[0]),
+-                          memory_order_relaxed);
+-    atomic_store_explicit(&channel->peak[1],
+-                          cdj3k_mixer_peak_raw(peak[1]),
+-                          memory_order_relaxed);
+-}
+-
+-static void cdj3k_mixer_init(CoreaudioVoiceOut *core)
++static int cdj3k_mixer_init(CoreaudioVoiceOut *core)
+ {
+     const char *path = getenv("CDJ3K_EMU_MIXER_SHM");
+     const char *channel_env = getenv("CDJ3K_EMU_MIXER_CHANNEL");
+     char *end = NULL;
+     long channel_index = channel_env ? strtol(channel_env, &end, 10) : -1;
+ 
+-    core->mixer_trim_gain = 1.0f;
+-    core->mixer_high_gain = 1.0f;
+-    core->mixer_mid_gain = 1.0f;
+-    core->mixer_low_gain = 1.0f;
+-    core->mixer_fader_gain = 1.0f;
+-    core->mixer_crossfader_gain = 1.0f;
+-    core->mixer_filter_alpha = 1.0f;
+-    core->mixer_coefficients_valid = false;
+-    if (!path || !path[0] || channel_index < 0
+-        || channel_index >= CDJ3K_MIXER_CHANNELS
+-        || (end && *end != '\0')) {
+-        return;
++    if (!path || !path[0] || channel_index < 0 ||
++        channel_index >= CDJ3K_MIXER_CHANNELS || (end && *end != '\0')) {
++        error_report("coreaudio transport: shared mixer environment is missing or invalid");
++        return -1;
+     }
+ 
+     int fd = open(path, O_RDWR);
+     if (fd < 0) {
+-        error_report("coreaudio: could not open virtual mixer %s: %s",
++        error_report("coreaudio transport: could not open %s: %s",
+                      path, strerror(errno));
+-        return;
++        return -1;
+     }
+     void *mapping = mmap(NULL, CDJ3K_MIXER_BYTES, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, fd, 0);
+     close(fd);
+     if (mapping == MAP_FAILED) {
+-        error_report("coreaudio: could not map virtual mixer %s: %s",
++        error_report("coreaudio transport: could not map %s: %s",
+                      path, strerror(errno));
+-        return;
++        return -1;
+     }
+ 
+     _Atomic uint32_t *header = mapping;
+-    if (atomic_load_explicit(&header[0], memory_order_acquire)
+-            != CDJ3K_MIXER_MAGIC
+-        || atomic_load_explicit(&header[1], memory_order_relaxed)
+-            != CDJ3K_MIXER_VERSION) {
+-        error_report("coreaudio: virtual mixer has an incompatible layout");
++    if (atomic_load_explicit(&header[0], memory_order_acquire) !=
++            CDJ3K_MIXER_MAGIC ||
++        atomic_load_explicit(&header[1], memory_order_relaxed) !=
++            CDJ3K_MIXER_VERSION) {
++        error_report("coreaudio transport: shared mixer layout is incompatible");
+         munmap(mapping, CDJ3K_MIXER_BYTES);
+-        return;
++        return -1;
+     }
++
+     core->mixer_map = mapping;
+     core->mixer_map_size = CDJ3K_MIXER_BYTES;
+-    core->mixer_crossfader = &header[2];
+-    core->mixer_channel_index = channel_index;
+     core->mixer_channel = (Cdj3kMixerChannel *)
+-        ((uint8_t *)mapping + CDJ3K_MIXER_HEADER_BYTES
+-         + channel_index * CDJ3K_MIXER_CHANNEL_BYTES);
++        ((uint8_t *)mapping + CDJ3K_MIXER_HEADER_BYTES +
++         channel_index * CDJ3K_MIXER_CHANNEL_BYTES);
++
+     extern void virtio_snd_external_ring_configure(
+         void *, _Atomic uint64_t *, _Atomic uint64_t *,
+         _Atomic uint32_t *, _Atomic uint32_t *);
+-    uint8_t *ring = (uint8_t *)mapping + CDJ3K_MIXER_RING_BASE
+-                    + channel_index * CDJ3K_MIXER_RING_BYTES;
+-    if (atomic_load_explicit(&header[3], memory_order_acquire) != 0) {
+-        virtio_snd_external_ring_configure(
+-            ring, &core->mixer_channel->ring_head,
+-            &core->mixer_channel->ring_tail, &header[3],
+-            &core->mixer_channel->ring_active);
+-    }
++    uint8_t *ring = (uint8_t *)mapping + CDJ3K_MIXER_RING_BASE +
++                    channel_index * CDJ3K_MIXER_RING_BYTES;
++    virtio_snd_external_ring_configure(
++        ring, &core->mixer_channel->ring_head,
++        &core->mixer_channel->ring_tail, &core->mixer_channel->source_rate,
++        &core->mixer_channel->ring_active);
++    return 0;
+ }
+ 
+ static void cdj3k_mixer_fini(CoreaudioVoiceOut *core)
+ {
+-    cdj3k_mixer_publish_silence(core);
+     extern void virtio_snd_external_ring_configure(
+         void *, _Atomic uint64_t *, _Atomic uint64_t *,
+         _Atomic uint32_t *, _Atomic uint32_t *);
+     virtio_snd_external_ring_configure(NULL, NULL, NULL, NULL, NULL);
+-    core->mixer_crossfader = NULL;
+     core->mixer_channel = NULL;
+     if (core->mixer_map) {
+         munmap(core->mixer_map, core->mixer_map_size);
+@@ -817,808 +179,50 @@
+     }
+ }
+ 
+-static void coreaudio_silence_output(AudioBufferList *output)
+-{
+-    if (!output) {
+-        return;
+-    }
+-    for (UInt32 i = 0; i < output->mNumberBuffers; i++) {
+-        AudioBuffer *buffer = &output->mBuffers[i];
+-
+-        if (buffer->mData && buffer->mDataByteSize) {
+-            memset(buffer->mData, 0, buffer->mDataByteSize);
+-        }
+-    }
+-}
+-
+-/*
+- * callback to feed audiooutput buffer. called without BQL.
+- * allowed to lock "buf_mutex", but disallowed to have any other locks.
+- */
+-static OSStatus out_device_ioproc(
+-    AudioDeviceID inDevice,
+-    const AudioTimeStamp *inNow,
+-    const AudioBufferList *inInputData,
+-    const AudioTimeStamp *inInputTime,
+-    AudioBufferList *outOutputData,
+-    const AudioTimeStamp *inOutputTime,
+-    void *hwptr)
+-{
+-    UInt32 frame_size, pending_frames;
+-    HWVoiceOut *hw = hwptr;
+-    CoreaudioVoiceOut *core = hwptr;
+-    AudioBuffer *output;
+-    void *out;
+-    void *out_start;
+-    size_t len;
+-
+-    if (!outOutputData || outOutputData->mNumberBuffers == 0
+-        || hw->info.bytes_per_frame <= 0) {
+-        coreaudio_silence_output(outOutputData);
+-        cdj3k_mixer_publish_silence(core);
+-        return 0;
+-    }
+-
+-    /* The negotiated format is interleaved, so the first buffer contains
+-     * every channel. Clear any extra buffers defensively: aggregate devices
+-     * can occasionally expose additional streams in their callback list. */
+-    for (UInt32 i = 1; i < outOutputData->mNumberBuffers; i++) {
+-        AudioBuffer *extra = &outOutputData->mBuffers[i];
+-
+-        if (extra->mData && extra->mDataByteSize) {
+-            memset(extra->mData, 0, extra->mDataByteSize);
+-        }
+-    }
+-    output = &outOutputData->mBuffers[0];
+-    if (!output->mData
+-        || output->mDataByteSize % hw->info.bytes_per_frame != 0
+-        || (output->mNumberChannels != 0
+-            && output->mNumberChannels != hw->info.nchannels)) {
+-        coreaudio_silence_output(outOutputData);
+-        cdj3k_mixer_publish_silence(core);
+-        return 0;
+-    }
+-
+-    out = output->mData;
+-    out_start = out;
+-    len = output->mDataByteSize;
+-    frame_size = len / hw->info.bytes_per_frame;
+-    if (frame_size == 0) {
+-        cdj3k_mixer_publish_silence(core);
+-        return 0;
+-    }
+-
+-    /* The singleton native mixer owns the shared ring and the only audible
+-     * output stream. Keep this legacy QEMU IOProc silent and, critically, do
+-     * not advance the ring tail. */
+-    extern int virtio_snd_external_ring_is_active(void);
+-    if (virtio_snd_external_ring_is_active()) {
+-        memset(out, 0, len);
+-        return 0;
+-    }
+-
+-    /* cdj3k-emu: bypass fast-path is LOCK-FREE and runs BEFORE buf_mutex
+-     * acquire. The ring is SPSC-atomic and bytes_per_frame / device_id are
+-     * set once at init and never mutated, so the bypass read needs no
+-     * synchronization. Hoisting this
+-     * above the mutex is critical for stress robustness: QEMU's audio
+-     * frontend periodically calls our `audio_generic_*` wrappers (each
+-     * grabs buf_mutex) on the main thread; if the main thread is
+-     * preempted while holding the mutex, the IOProc blocks for the full
+-     * preemption window, the DAC underruns, and CoreAudio plays whatever
+-     * stale data was left in `out` - audible as "plastic pops" or, under
+-     * sustained main-thread preemption, sample-uncorrelated white noise.
+-     * The fix is to never block in the IOProc when the bypass owns the
+-     * stream. */
+-    extern int virtio_snd_bypass_is_active(void) __attribute__((weak_import));
+-    extern size_t virtio_snd_bypass_avail(void) __attribute__((weak_import));
+-    extern size_t virtio_snd_bypass_read(void *dst, size_t bytes)
+-        __attribute__((weak_import));
+-    extern void virtio_snd_bypass_note_underrun(uint32_t frames)
+-        __attribute__((weak_import));
+-    if (&virtio_snd_bypass_is_active && virtio_snd_bypass_is_active()
+-        && inDevice == core->device_id && len > 0) {
+-        /* HAL pipeline-depth measurement: cheap atomic store, safe
+-         * lock-free. virtio-snd reads it lock-free via atomic load. */
+-        if (inOutputTime && (inOutputTime->mFlags & kAudioTimeStampHostTimeValid)) {
+-            static mach_timebase_info_data_t s_tb;
+-            if (s_tb.denom == 0) mach_timebase_info(&s_tb);
+-            uint64_t now = mach_absolute_time();
+-            uint64_t fut = inOutputTime->mHostTime;
+-            uint64_t ticks = (fut > now) ? (fut - now) : 0;
+-            uint64_t us = (ticks * s_tb.numer) / ((uint64_t)s_tb.denom * 1000ULL);
+-            if (us > 1000000) us = 1000000;
+-            atomic_store_explicit(&g_coreaudio_pipeline_depth_us,
+-                                  (uint32_t)us, memory_order_relaxed);
+-        }
+-
+-        if (virtio_snd_bypass_avail() < len) {
+-            /* Ring underrun: emit silence (still better than stale data).
+-             * Record so the periodic logger sees real ring-empty events. */
+-            memset(out, 0, len);
+-            cdj3k_mixer_publish_silence(core);
+-            if (&virtio_snd_bypass_note_underrun) {
+-                virtio_snd_bypass_note_underrun(frame_size);
+-            }
+-            return 0;
+-        }
+-        virtio_snd_bypass_read(out, len);
+-        cdj3k_mixer_process(core, out, frame_size);
+-        return 0;
+-    }
+-
+-    /* AUD_write fallback path (no bypass active, or bypass refused).
+-     * Touches hw->buf_emul / pos_emul / pending_emul which ARE protected
+-     * by buf_mutex - safe to acquire here.
+-     *
+-     * CRITICAL: every early-return below MUST first fill `out` with
+-     * silence. The IOProc's `out` buffer is owned by CoreAudio and is
+-     * NOT zeroed between fires - returning without writing leaves
+-     * whatever was already there (typically the previous fire's audio)
+-     * for the DAC to play again. That produces sample-and-hold
+-     * "plateau" artifacts in the recorded output: the audio appears to
+-     * freeze at one level for a few frames, then cut over to fresh
+-     * audio. The iZotope RX waveforms showing cliff→flat→cliff→flat
+-     * patterns are exactly this. The only safe non-fill exit is the
+-     * bypass path above (which writes via bypass_read or memset). */
+-    if (coreaudio_voice_out_buf_lock(core, "out_device_ioproc")) {
+-        inInputTime = 0;
+-        memset(out, 0, len);
+-        cdj3k_mixer_publish_silence(core);
+-        return 0;
+-    }
+-
+-    if (inDevice != core->device_id) {
+-        memset(out, 0, len);
+-        cdj3k_mixer_publish_silence(core);
+-        coreaudio_voice_out_buf_unlock(core, "out_device_ioproc(old device)");
+-        return 0;
+-    }
+-
+-    if (inOutputTime && (inOutputTime->mFlags & kAudioTimeStampHostTimeValid)) {
+-        static mach_timebase_info_data_t s_tb;
+-        if (s_tb.denom == 0) mach_timebase_info(&s_tb);
+-        uint64_t now = mach_absolute_time();
+-        uint64_t fut = inOutputTime->mHostTime;
+-        uint64_t ticks = (fut > now) ? (fut - now) : 0;
+-        uint64_t us = (ticks * s_tb.numer) / ((uint64_t)s_tb.denom * 1000ULL);
+-        if (us > 1000000) us = 1000000;
+-        atomic_store_explicit(&g_coreaudio_pipeline_depth_us,
+-                              (uint32_t)us, memory_order_relaxed);
+-    }
+-
+-    pending_frames = hw->pending_emul / hw->info.bytes_per_frame;
+-
+-    /* if there are not enough samples, set signal and emit silence */
+-    if (pending_frames < frame_size) {
+-        inInputTime = 0;
+-        memset(out, 0, len);
+-        cdj3k_mixer_publish_silence(core);
+-        coreaudio_voice_out_buf_unlock(core, "out_device_ioproc(empty)");
+-        return 0;
+-    }
+-
+-    while (len) {
+-        size_t write_len, start;
+-
+-        start = audio_ring_posb(hw->pos_emul, hw->pending_emul, hw->size_emul);
+-        assert(start < hw->size_emul);
+-
+-        write_len = MIN(MIN(hw->pending_emul, len),
+-                        hw->size_emul - start);
+-
+-        memcpy(out, hw->buf_emul + start, write_len);
+-        hw->pending_emul -= write_len;
+-        len -= write_len;
+-        out += write_len;
+-    }
+-
+-    cdj3k_mixer_process(core, out_start, frame_size);
+-    coreaudio_voice_out_buf_unlock(core, "out_device_ioproc");
+-    return 0;
+-}
+-
+-/* Invalidate virtio-snd's bypass flag (forces the slow AUD_write path).
+- * Resolved weakly so test-audio (which doesn't link virtio-snd) still
+- * links - when unresolved we're a no-op. */
+-static void coreaudio_invalidate_bypass(const char *reason)
+-{
+-    extern void virtio_snd_bypass_invalidate(const char *) __attribute__((weak_import));
+-    if (&virtio_snd_bypass_invalidate) {
+-        virtio_snd_bypass_invalidate(reason);
+-    }
+-}
+-
+-/* HAL listener: device's nominal rate changed under us (user opened AMS,
+- * another app bumped it - notably Audio Hijack forces 44100 Hz when
+- * starting a session - BT renegotiated, etc.).
+- *
+- * We deliberately do NOT invalidate the bypass here anymore. Earlier
+- * versions did, but in practice the auto-invalidate is harmful: the
+- * AUD_write fallback's resampler glitches audibly ("prrt prrt prrt" on
+- * each transient) whereas the bypass path running with a mildly wrong
+- * rate just produces a continuous pitch shift, which is way less
+- * obtrusive AND lets the user successfully record through recording
+- * tools that flip the device rate. The next virtio-snd PCM prepare
+- * will re-gate bypass with the fresh cached rate; until then,
+- * continuous-if-slightly-off audio is the right tradeoff.
+- *
+- * We still refresh the cached samplerate so virtio_snd_bypass_depth_frames
+- * (and thus the guest's audio_latency_ms sysfs) stays accurate. */
+-static OSStatus handle_rate_change(AudioObjectID in_object_id,
+-                                   UInt32 in_number_addresses,
+-                                   const AudioObjectPropertyAddress *in_addresses,
+-                                   void *in_client_data)
+-{
+-    (void)in_number_addresses;
+-    (void)in_addresses;
+-    (void)in_client_data;
+-    coreaudio_refresh_cached_samplerate(in_object_id);
+-    return noErr;
+-}
+-
+-static bool coreaudio_streamformat_is_compatible(
+-    const AudioStreamBasicDescription *format, unsigned channels)
+-{
+-    return format->mSampleRate > 0
+-        && format->mFormatID == kAudioFormatLinearPCM
+-        && (format->mFormatFlags & kAudioFormatFlagIsFloat) != 0
+-        && (format->mFormatFlags & kAudioFormatFlagIsBigEndian) == 0
+-        && (format->mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+-        && format->mBitsPerChannel == sizeof(float) * 8
+-        && format->mChannelsPerFrame == channels
+-        && format->mFramesPerPacket == 1
+-        && format->mBytesPerFrame == channels * sizeof(float)
+-        && format->mBytesPerPacket == format->mBytesPerFrame;
+-}
+-
+-/* Keep a device's existing virtual format whenever it already matches the
+- * interleaved float buffer produced by this backend. This matters for
+- * loopback/aggregate drivers, which often expose a valid fixed format but
+- * reject otherwise-redundant SetProperty calls. */
+-static OSStatus coreaudio_negotiate_out_streamformat(
+-    CoreaudioVoiceOut *core, AudioDeviceID device_id,
+-    AudioStreamBasicDescription *active_format)
+-{
+-    AudioStreamBasicDescription current = { 0 };
+-    OSStatus status = coreaudio_get_out_streamformat(device_id, &current);
+-
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not get output stream format");
+-        return status;
+-    }
+-    if (coreaudio_streamformat_is_compatible(&current,
+-                                              core->hw.info.nchannels)) {
+-        *active_format = current;
+-        return kAudioHardwareNoError;
+-    }
+-
+-    Float64 rate = current.mSampleRate;
+-    if (rate <= 0) {
+-        UInt32 size = sizeof(rate);
+-
+-        status = AudioObjectGetPropertyData(device_id, &device_rate_addr,
+-                                            0, NULL, &size, &rate);
+-        if (status != kAudioHardwareNoError || rate <= 0) {
+-            if (status != kAudioHardwareNoError) {
+-                coreaudio_playback_logerr(
+-                    status, "Could not determine output stream rate");
+-                return status;
+-            }
+-            error_report("coreaudio: output device reports no usable "
+-                         "stream or nominal sample rate");
+-            return kAudioHardwareIllegalOperationError;
+-        }
+-    }
+-
+-    AudioStreamBasicDescription requested = {
+-        .mBitsPerChannel = sizeof(float) * 8,
+-        .mBytesPerFrame = core->hw.info.nchannels * sizeof(float),
+-        .mBytesPerPacket = core->hw.info.nchannels * sizeof(float),
+-        .mChannelsPerFrame = core->hw.info.nchannels,
+-        .mFormatFlags = kAudioFormatFlagsNativeFloatPacked,
+-        .mFormatID = kAudioFormatLinearPCM,
+-        .mFramesPerPacket = 1,
+-        .mSampleRate = rate,
+-    };
+-    Boolean settable = false;
+-
+-    status = AudioObjectIsPropertySettable(device_id,
+-                                           &out_stream_format_addr,
+-                                           &settable);
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not query output stream format mutability");
+-        return status;
+-    }
+-    if (!settable) {
+-        error_report("coreaudio: output stream format is fixed and incompatible "
+-                     "with %u-channel interleaved float32 playback "
+-                     "(rate=%.0f channels=%u bits=%u flags=0x%x)",
+-                     core->hw.info.nchannels, current.mSampleRate,
+-                     (unsigned)current.mChannelsPerFrame,
+-                     (unsigned)current.mBitsPerChannel,
+-                     (unsigned)current.mFormatFlags);
+-        return kAudioHardwareIllegalOperationError;
+-    }
+-
+-    status = coreaudio_set_out_streamformat(device_id, &requested);
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not set compatible output stream format");
+-        return status;
+-    }
+-
+-    status = coreaudio_get_out_streamformat(device_id, &current);
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not verify output stream format");
+-        return status;
+-    }
+-    if (!coreaudio_streamformat_is_compatible(&current,
+-                                               core->hw.info.nchannels)) {
+-        error_report("coreaudio: device did not accept a compatible "
+-                     "%u-channel interleaved float32 stream format",
+-                     core->hw.info.nchannels);
+-        return kAudioHardwareIllegalOperationError;
+-    }
+-
+-    *active_format = current;
+-    return kAudioHardwareNoError;
+-}
+-
+-static OSStatus init_out_device(CoreaudioVoiceOut *core)
+-{
+-    AudioDeviceID device_id;
+-    AudioDeviceIOProcID ioprocid;
+-    AudioStreamBasicDescription stream_basic_description = { 0 };
+-    AudioValueRange value_range;
+-    OSStatus status;
+-    UInt32 device_frame_size;
+-    Audiodev *dev = core->hw.s->dev;
+-    AudiodevCoreaudioPerDirectionOptions *cpdo = dev->u.coreaudio.out;
+-
+-    core->device_id = kAudioDeviceUnknown;
+-    core->ioprocid = NULL;
+-    core->rate_listener_installed = false;
+-
+-    status = coreaudio_get_voice_out(&device_id);
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not get default output device");
+-        return status;
+-    }
+-    if (device_id == kAudioDeviceUnknown) {
+-        error_report("coreaudio: Could not initialize playback: "
+-                     "Unknown audio device");
+-        return kAudioHardwareBadDeviceError;
+-    }
+-
+-    status = coreaudio_negotiate_out_streamformat(
+-        core, device_id, &stream_basic_description);
+-    if (status != kAudioHardwareNoError) {
+-        return status;
+-    }
+-
+-    /* Convert the requested duration to frames using the HAL stream's
+-     * actual clock rate. Recompute from the duration on every device init;
+-     * rescaling a prior frame count would accumulate error across handoffs. */
+-    struct audsettings device_as = {
+-        .freq = (int)(stream_basic_description.mSampleRate + 0.5),
+-        .nchannels = core->hw.info.nchannels,
+-        .fmt = AUDIO_FORMAT_F32,
+-        .big_endian = false,
+-    };
+-    core->frame_size_setting = audio_buffer_frames(
+-        qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo),
+-        &device_as, 11610);
+-
+-    /* Query static device latency: kAudioDevicePropertyLatency +
+-     * kAudioDevicePropertySafetyOffset (USB transit + DAC pipeline). */
+-    {
+-        UInt32 dev_latency = 0, safety_offset = 0;
+-        UInt32 sz = sizeof(UInt32);
+-        AudioObjectPropertyAddress addr_lat = {
+-            kAudioDevicePropertyLatency,
+-            kAudioDevicePropertyScopeOutput,
+-            kAudioObjectPropertyElementMain,
+-        };
+-        AudioObjectPropertyAddress addr_safe = {
+-            kAudioDevicePropertySafetyOffset,
+-            kAudioDevicePropertyScopeOutput,
+-            kAudioObjectPropertyElementMain,
+-        };
+-        OSStatus s1 = AudioObjectGetPropertyData(device_id, &addr_lat, 0,
+-                                                  NULL, &sz, &dev_latency);
+-        sz = sizeof(UInt32);
+-        OSStatus s2 = AudioObjectGetPropertyData(device_id, &addr_safe, 0,
+-                                                  NULL, &sz, &safety_offset);
+-        uint32_t total = 0;
+-        if (s1 == noErr) total += dev_latency;
+-        if (s2 == noErr) total += safety_offset;
+-        atomic_store_explicit(&g_coreaudio_static_latency_frames, total,
+-                              memory_order_relaxed);
+-        fprintf(stderr,
+-                "coreaudio: static device latency = %u frames "
+-                "(latency=%u safety=%u)\n",
+-                total, dev_latency, safety_offset);
+-    }
+-
+-    /* get minimum and maximum buffer frame sizes */
+-    status = coreaudio_get_out_framesizerange(device_id, &value_range);
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not get device buffer frame range");
+-        return status;
+-    }
+-
+-    if (value_range.mMinimum > core->frame_size_setting) {
+-        device_frame_size = value_range.mMinimum;
+-        warn_report("coreaudio: Upsizing buffer frames to %f",
+-                    value_range.mMinimum);
+-    } else if (value_range.mMaximum < core->frame_size_setting) {
+-        device_frame_size = value_range.mMaximum;
+-        warn_report("coreaudio: Downsizing buffer frames to %f",
+-                    value_range.mMaximum);
+-    } else {
+-        device_frame_size = core->frame_size_setting;
+-    }
+-
+-    UInt32 current_frame_size = 0;
+-    status = coreaudio_get_out_framesize(device_id, &current_frame_size);
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not get device buffer frame size");
+-        return status;
+-    }
+-    if (current_frame_size != device_frame_size) {
+-        Boolean settable = false;
+-
+-        status = AudioObjectIsPropertySettable(device_id,
+-                                               &out_frame_size_addr,
+-                                               &settable);
+-        if (status != kAudioHardwareNoError) {
+-            coreaudio_playback_logerr(
+-                status, "Could not query buffer frame size mutability");
+-            return status;
+-        }
+-        if (settable) {
+-            status = coreaudio_set_out_framesize(device_id,
+-                                                 &device_frame_size);
+-            if (status != kAudioHardwareNoError) {
+-                coreaudio_playback_logerr(
+-                    status, "Could not set device buffer frame size %" PRIu32,
+-                    (uint32_t)device_frame_size);
+-                return status;
+-            }
+-        } else {
+-            warn_report("coreaudio: Device buffer frame size is fixed at %u "
+-                        "frames (requested %u)",
+-                        (unsigned)current_frame_size,
+-                        (unsigned)device_frame_size);
+-            device_frame_size = current_frame_size;
+-        }
+-    }
+-
+-    /* Read back the actual size: drivers may clamp a set request further. */
+-    status = coreaudio_get_out_framesize(device_id, &device_frame_size);
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not get device buffer frame size");
+-        return status;
+-    }
+-    fprintf(stderr,
+-            "coreaudio: output stream %.0f Hz, buffer requested=%d "
+-            "actual=%u frames (%.2f ms)\n",
+-            stream_basic_description.mSampleRate,
+-            core->frame_size_setting, (unsigned)device_frame_size,
+-            1000.0 * device_frame_size
+-                / stream_basic_description.mSampleRate);
+-
+-    /*
+-     * set Callback.
+-     *
+-     * On macOS 11.3.1, Core Audio calls AudioDeviceIOProc after calling an
+-     * internal function named HALB_Mutex::Lock(), which locks a mutex in
+-     * HALB_IOThread::Entry(void*). HALB_Mutex::Lock() is also called in
+-     * AudioObjectGetPropertyData, which is called by coreaudio driver.
+-     * Therefore, the specified callback must be designed to avoid a deadlock
+-     * with the callers of AudioObjectGetPropertyData.
+-     */
+-    ioprocid = NULL;
+-    status = AudioDeviceCreateIOProcID(device_id,
+-                                       out_device_ioproc,
+-                                       &core->hw,
+-                                       &ioprocid);
+-    if (status != kAudioHardwareNoError || ioprocid == NULL) {
+-        if (status == kAudioHardwareNoError) {
+-            status = kAudioHardwareUnspecifiedError;
+-        }
+-        coreaudio_playback_logerr(status, "Could not set IOProc");
+-        return status;
+-    }
+-
+-    core->device_id = device_id;
+-    core->device_frame_size = device_frame_size;
+-    core->hw.samples = core->buffer_count * core->device_frame_size;
+-    audio_generic_initialize_buffer_out(&core->hw);
+-    core->ioprocid = ioprocid;
+-    atomic_store_explicit(
+-        &g_coreaudio_cached_samplerate,
+-        (unsigned)(stream_basic_description.mSampleRate + 0.5),
+-        memory_order_relaxed);
+-
+-    /* Subscribe to nominal-rate changes on the bound device. If the
+-     * user opens AMS, Audio Hijack flips the device rate, or BT
+-     * renegotiates, the listener fires on a HAL thread and refreshes
+-     * our cached samplerate so virtio-snd's writer-side resampler picks
+-     * up the new ratio on its next call. We deliberately don't
+-     * invalidate the bypass on these events anymore (we used to) - the
+-     * resampler handles arbitrary rate pairs continuously, so the
+-     * smoother behavior is "track the new rate" rather than "fall back
+-     * to QEMU's glitchy mixer". */
+-    {
+-        OSStatus lst = AudioObjectAddPropertyListener(device_id,
+-                                                     &device_rate_addr,
+-                                                     handle_rate_change,
+-                                                     core);
+-        if (lst != kAudioHardwareNoError) {
+-            coreaudio_playback_logerr(lst,
+-                                      "Could not listen for nominal rate changes "
+-                                      "(cached samplerate may go stale on HAL rate flips)");
+-        } else {
+-            core->rate_listener_installed = true;
+-        }
+-    }
+-
+-    /* cdj3k-emu: start the device once and leave it running until fini.
+-     * AudioDeviceStart/Stop blocks the BQL main loop for ~1s inside
+-     * CoreAudio's HAL mutex; we avoid toggling it on guest pause/resume
+-     * (see coreaudio_enable_out NOOP). The IOProc returns silence when
+-     * the bypass ring is empty, so leaving it running is harmless. */
+-    core->enabled = true;
+-    status = AudioDeviceStart(core->device_id, core->ioprocid);
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not start playback at init");
+-        if (core->rate_listener_installed) {
+-            AudioObjectRemovePropertyListener(core->device_id,
+-                                              &device_rate_addr,
+-                                              handle_rate_change,
+-                                              core);
+-            core->rate_listener_installed = false;
+-        }
+-        OSStatus destroy_status = AudioDeviceDestroyIOProcID(
+-            core->device_id, core->ioprocid);
+-        if (destroy_status != kAudioHardwareNoError
+-            && destroy_status != kAudioHardwareBadDeviceError) {
+-            coreaudio_logerr(destroy_status,
+-                             "Could not remove failed playback IOProc");
+-        }
+-        coreaudio_invalidate_bypass("CoreAudio device failed to start");
+-        core->enabled = false;
+-        core->ioprocid = NULL;
+-        core->device_id = kAudioDeviceUnknown;
+-        cdj3k_emu_active_output_device = kAudioDeviceUnknown;
+-        atomic_store_explicit(&g_coreaudio_cached_samplerate, 0,
+-                              memory_order_relaxed);
+-        return status;
+-    }
+-
+-    /* Publish only after AudioDeviceStart succeeds. A failed device must not
+-     * make virtio-snd enable a bypass ring that no callback will drain. */
+-    cdj3k_emu_active_output_device = device_id;
+-
+-    return 0;
+-}
+-
+-static void fini_out_device(CoreaudioVoiceOut *core)
+-{
+-    OSStatus status;
+-    UInt32 isrunning = 0;
+-
+-    if (core->device_id == kAudioDeviceUnknown) {
+-        return;
+-    }
+-
+-    /* cdj3k-emu: detach the rate-change listener before tearing the device
+-     * down. Errors here are diagnostic only - the device id is about to be
+-     * invalidated either way. */
+-    if (core->rate_listener_installed) {
+-        OSStatus lst = AudioObjectRemovePropertyListener(core->device_id,
+-                                                        &device_rate_addr,
+-                                                        handle_rate_change,
+-                                                        core);
+-        if (lst != kAudioHardwareNoError
+-            && lst != kAudioHardwareBadObjectError) {
+-            coreaudio_logerr(lst,
+-                             "Could not remove nominal-rate listener");
+-        }
+-        core->rate_listener_installed = false;
+-    }
+-
+-    /* And invalidate any bypass that was riding on this device. */
+-    coreaudio_invalidate_bypass("output device teardown");
+-
+-    /* stop playback */
+-    status = coreaudio_get_out_isrunning(core->device_id, &isrunning);
+-    if (status != kAudioHardwareBadObjectError) {
+-        if (status != kAudioHardwareNoError) {
+-            coreaudio_logerr(status,
+-                             "Could not determine whether device is playing");
+-        }
+-
+-        if (isrunning) {
+-            status = AudioDeviceStop(core->device_id, core->ioprocid);
+-            if (status != kAudioHardwareBadDeviceError && status != kAudioHardwareNoError) {
+-                coreaudio_logerr(status, "Could not stop playback");
+-            }
+-        }
+-    }
+-
+-    /* remove callback */
+-    status = AudioDeviceDestroyIOProcID(core->device_id,
+-                                        core->ioprocid);
+-    if (status != kAudioHardwareBadDeviceError && status != kAudioHardwareNoError) {
+-        coreaudio_logerr(status, "Could not remove IOProc");
+-    }
+-    core->device_id = kAudioDeviceUnknown;
+-    core->ioprocid = NULL;
+-    cdj3k_emu_active_output_device = kAudioDeviceUnknown;
+-    /* Zero the samplerate cache so any virtio-snd read in the gap before
+-     * the next init_out_device sees 0 (which makes the bypass gate refuse
+-     * cleanly rather than miscomparing against a stale rate). */
+-    atomic_store_explicit(&g_coreaudio_cached_samplerate, 0,
+-                          memory_order_relaxed);
+-}
+-
+-/* called without BQL. */
+-static OSStatus handle_voice_out_change(
+-    AudioObjectID in_object_id,
+-    UInt32 in_number_addresses,
+-    const AudioObjectPropertyAddress *in_addresses,
+-    void *in_client_data)
+-{
+-    CoreaudioVoiceOut *core = in_client_data;
+-
+-    /* cdj3k-emu: the default-output device just changed (e.g. user moved
+-     * audio in Sound Preferences, BT headset connected/disconnected). The
+-     * IOProc is about to migrate via fini/init_out_device - meanwhile
+-     * invalidate the bypass so virtio-snd doesn't keep feeding the old
+-     * device. The fresh init will install a new rate listener and pick
+-     * the right rate; the next PCM prepare will re-gate the bypass. */
+-    coreaudio_invalidate_bypass("default output device changed");
+-
+-    bql_lock();
+-
+-    if (core->device_id) {
+-        fini_out_device(core);
+-    }
+-
+-    init_out_device(core);
+-
+-    bql_unlock();
+-    return 0;
+-}
+-
+ static int coreaudio_init_out(HWVoiceOut *hw, struct audsettings *as)
+ {
+-    OSStatus status;
+     CoreaudioVoiceOut *core = (CoreaudioVoiceOut *)hw;
+-    int err;
+-    Audiodev *dev = hw->s->dev;
+-    AudiodevCoreaudioPerDirectionOptions *cpdo = dev->u.coreaudio.out;
+-    struct audsettings obt_as;
++    AudiodevCoreaudioPerDirectionOptions *cpdo = hw->s->dev->u.coreaudio.out;
++    struct audsettings obtained = *as;
++    int err = pthread_mutex_init(&core->buf_mutex, NULL);
+ 
+-    /* create mutex */
+-    err = pthread_mutex_init(&core->buf_mutex, NULL);
+     if (err) {
+-        error_report("coreaudio: Could not create mutex: %s", strerror(err));
++        error_report("coreaudio transport: could not create mutex: %s",
++                     strerror(err));
+         return -1;
+     }
+ 
+-    obt_as = *as;
+-    as = &obt_as;
+-    as->fmt = AUDIO_FORMAT_F32;
+-    audio_pcm_init_info(&hw->info, as);
+-    cdj3k_mixer_init(core);
+-
+-    core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
+-
+-    /* The external ring needs an AudioState voice for virtio-snd negotiation,
+-     * but it does not need (or want) a per-player HAL IOProc. The singleton
+-     * native mixer owns the sole hardware output unit. */
+-    extern int virtio_snd_external_ring_is_active(void);
+-    if (virtio_snd_external_ring_is_active()) {
+-        core->frame_size_setting = audio_buffer_frames(
+-            qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), as, 11610);
+-        core->device_frame_size = core->frame_size_setting;
+-        core->hw.samples = core->buffer_count * core->device_frame_size;
+-        audio_generic_initialize_buffer_out(&core->hw);
+-        core->device_id = kAudioDeviceUnknown;
+-        core->ioprocid = NULL;
+-        return 0;
+-    }
+-
+-    /* cdj3k-emu: capture the per-instance device UID (if the user picked one
+-     * via the Audio → Output Device menu). Stored process-globally so the
+-     * default-device-change listener path also honors it. Empty string means
+-     * "use system default" - clear the global so a stale value from a prior
+-     * config doesn't leak across audiodev recreations. */
+-    g_free(cdj3k_emu_preferred_device_uid);
+-    cdj3k_emu_preferred_device_uid = NULL;
+-    if (cpdo->device_uid && cpdo->device_uid[0]) {
+-        cdj3k_emu_preferred_device_uid = g_strdup(cpdo->device_uid);
+-    }
+-
+-    status = AudioObjectAddPropertyListener(kAudioObjectSystemObject,
+-                                            &voice_out_addr,
+-                                            handle_voice_out_change,
+-                                            core);
+-    if (status != kAudioHardwareNoError) {
+-        coreaudio_playback_logerr(status,
+-                                  "Could not listen to voice property change");
+-        cdj3k_mixer_fini(core);
++    obtained.fmt = AUDIO_FORMAT_F32;
++    audio_pcm_init_info(&hw->info, &obtained);
++    if (cdj3k_mixer_init(core)) {
+         pthread_mutex_destroy(&core->buf_mutex);
+         return -1;
+     }
+ 
+-    if (init_out_device(core)) {
+-        status = AudioObjectRemovePropertyListener(kAudioObjectSystemObject,
+-                                                   &voice_out_addr,
+-                                                   handle_voice_out_change,
+-                                                   core);
+-        if (status != kAudioHardwareNoError) {
+-            coreaudio_playback_logerr(status,
+-                                      "Could not remove voice property change listener");
+-        }
+-        cdj3k_mixer_fini(core);
+-        pthread_mutex_destroy(&core->buf_mutex);
+-        return -1;
+-    }
+-
++    core->buffer_count = cpdo->has_buffer_count ? cpdo->buffer_count : 4;
++    int frame_size = audio_buffer_frames(
++        qapi_AudiodevCoreaudioPerDirectionOptions_base(cpdo), &obtained,
++        11610);
++    hw->samples = core->buffer_count * frame_size;
++    audio_generic_initialize_buffer_out(hw);
+     return 0;
+ }
+ 
+-static void coreaudio_fini_out (HWVoiceOut *hw)
++static void coreaudio_fini_out(HWVoiceOut *hw)
+ {
+-    OSStatus status;
+-    int err;
+     CoreaudioVoiceOut *core = (CoreaudioVoiceOut *)hw;
+-
+-    extern int virtio_snd_external_ring_is_active(void);
+-    if (!virtio_snd_external_ring_is_active()) {
+-        status = AudioObjectRemovePropertyListener(kAudioObjectSystemObject,
+-                                                   &voice_out_addr,
+-                                                   handle_voice_out_change,
+-                                                   core);
+-        if (status != kAudioHardwareNoError) {
+-            coreaudio_logerr(status, "Could not remove voice property change listener");
+-        }
+-
+-        fini_out_device(core);
+-    }
+     cdj3k_mixer_fini(core);
+-
+-    /* destroy mutex */
+-    err = pthread_mutex_destroy(&core->buf_mutex);
++    int err = pthread_mutex_destroy(&core->buf_mutex);
+     if (err) {
+-        error_report("coreaudio: Could not destroy mutex: %s", strerror(err));
++        error_report("coreaudio transport: could not destroy mutex: %s",
++                     strerror(err));
+     }
+ }
+ 
+ static void coreaudio_enable_out(HWVoiceOut *hw, bool enable)
+ {
+     CoreaudioVoiceOut *core = (CoreaudioVoiceOut *)hw;
+-
+     core->enabled = enable;
+-    /* cdj3k-emu: don't toggle the CoreAudio device on guest pause/resume -
+-     * AudioDeviceStart/Stop blocks the BQL main loop for ~1s inside
+-     * CoreAudio's HAL mutex, freezing every other emulated device. The
+-     * IOProc returns silence when the bypass ring is empty, so leaving
+-     * the device running is harmless. We start once at end of
+-     * init_out_device. */
+ }
+ 
+ static void audio_coreaudio_class_init(ObjectClass *klass, const void *data)
+@@ -1629,16 +233,11 @@
+     k->max_voices_in = 0;
+     k->voice_size_out = sizeof(CoreaudioVoiceOut);
+     k->voice_size_in = 0;
+-
+     k->init_out = coreaudio_init_out;
+     k->fini_out = coreaudio_fini_out;
+-    /* wrapper for audio_generic_write */
+     k->write = coreaudio_write;
+-    /* wrapper for audio_generic_buffer_get_free */
+     k->buffer_get_free = coreaudio_buffer_get_free;
+-    /* wrapper for audio_generic_get_buffer_out */
+     k->get_buffer_out = coreaudio_get_buffer_out;
+-    /* wrapper for audio_generic_put_buffer_out */
+     k->put_buffer_out = coreaudio_put_buffer_out;
+     k->enable_out = coreaudio_enable_out;
+ }
+diff --git a/audio/audio.c b/audio/audio.c
+--- a/audio/audio.c
++++ b/audio/audio.c
+@@ -49,8 +49,6 @@
+ }
+ 
+ static AudioBackend *default_audio_be;
+-static audio_reset_handler_fn audio_reset_handler;
+-static void *audio_reset_opaque;
+ 
+ static Object *get_audiodevs_root(void)
+ {
+@@ -60,27 +58,8 @@
+ void audio_cleanup(void)
+ {
+     default_audio_be = NULL;
+-    audio_reset_handler = NULL;
+-    audio_reset_opaque = NULL;
+ 
+     object_unparent(get_audiodevs_root());
+-}
+-
+-void audio_register_reset_handler(audio_reset_handler_fn handler, void *opaque)
+-{
+-    assert(handler != NULL);
+-    assert(audio_reset_handler == NULL ||
+-           (audio_reset_handler == handler && audio_reset_opaque == opaque));
+-    audio_reset_handler = handler;
+-    audio_reset_opaque = opaque;
+-}
+-
+-void audio_unregister_reset_handler(audio_reset_handler_fn handler, void *opaque)
+-{
+-    if (audio_reset_handler == handler && audio_reset_opaque == opaque) {
+-        audio_reset_handler = NULL;
+-        audio_reset_opaque = NULL;
+-    }
+ }
+ 
+ void audio_create_default_audiodevs(void)
+@@ -488,13 +467,4 @@
+         QAPI_LIST_PREPEND(ret, QAPI_CLONE(Audiodev, e->dev));
+     }
+     return ret;
+-}
+-
+-void qmp_x_cdj3k_audio_reset(Error **errp)
+-{
+-    if (!audio_reset_handler) {
+-        error_setg(errp, "No live virtio-sound output is available to reset");
+-        return;
+-    }
+-    audio_reset_handler(audio_reset_opaque, errp);
+ }
+diff --git a/include/qemu/audio.h b/include/qemu/audio.h
+--- a/include/qemu/audio.h
++++ b/include/qemu/audio.h
+@@ -33,7 +33,6 @@
+ #endif
+ 
+ typedef void (*audio_callback_fn) (void *opaque, int avail);
+-typedef void (*audio_reset_handler_fn)(void *opaque, Error **errp);
+ 
+ typedef struct audsettings {
+     int freq;
+@@ -164,11 +163,6 @@
+ 
+ void audio_cleanup(void);
+ 
+-/* Register the live device callback used by the cdj3k audio-reset QMP
+- * command. Registration and QMP dispatch both run under the BQL. */
+-void audio_register_reset_handler(audio_reset_handler_fn handler, void *opaque);
+-void audio_unregister_reset_handler(audio_reset_handler_fn handler, void *opaque);
+-
+ typedef struct st_sample st_sample;
+ 
+ void audio_add_audiodev(Audiodev *audio);
+diff --git a/qapi/audio.json b/qapi/audio.json
+--- a/qapi/audio.json
++++ b/qapi/audio.json
+@@ -158,17 +158,12 @@
+ #
+ # @buffer-count: number of buffers
+ #
+-# @device-uid: bind this stream to a CoreAudio device by UID
+-#     (kAudioDevicePropertyDeviceUID).  Unset = follow system default.
+-#     Output direction only today.  cdj3k-emu extension.
+-#
+ # Since: 4.0
+ ##
+ { 'struct': 'AudiodevCoreaudioPerDirectionOptions',
+   'base': 'AudiodevPerDirectionOptions',
+   'data': {
+-    '*buffer-count': 'uint32',
+-    '*device-uid': 'str' } }
++    '*buffer-count': 'uint32' } }
+ 
+ ##
+ # @AudiodevCoreaudioOptions:
+@@ -546,17 +541,3 @@
+ ##
+ { 'command': 'query-audiodevs',
+   'returns': ['Audiodev'] }
+-
+-##
+-# @x-cdj3k-audio-reset:
+-#
+-# Tear down and reopen the active virtio-sound host output while
+-# preserving the virtual machine and the guest stream's negotiated
+-# state.
+-#
+-# Errors are returned when no resettable output exists or the selected
+-# host audio device cannot be reopened.
+-#
+-# Since: cdj3k-emu 0.1.2
+-##
+-{ 'command': 'x-cdj3k-audio-reset' }
+diff --git a/hw/audio/virtio-snd.c b/hw/audio/virtio-snd.c
+--- a/hw/audio/virtio-snd.c
++++ b/hw/audio/virtio-snd.c
+@@ -39,11 +39,10 @@
+ static void virtio_snd_pcm_buffer_free(VirtIOSoundPCMBuffer *buffer);
+ static const char *print_code(uint32_t code);
+ 
+-/* ============= CoreAudio bypass ring (Darwin only) =============
+- * SPSC ring: virtio-snd writes (main loop), CoreAudio IOProc reads (RT).
+- * Bypasses QEMU's hw->buf_emul, eliminating ~15-20ms of mixer latency.
+- * Stereo, F32 or S32 (S32→F32 inline), with writer-side resampling when
+- * the guest and HAL clocks differ. Output only.
++/* ============= Native-mixer PCM transport (Darwin only) =============
++ * SPSC ring: virtio-snd writes from a dedicated thread and the singleton
++ * native mixer reads from its CoreAudio render callback. Stereo F32 at the
++ * negotiated guest rate; S32 input is converted inline. Output only.
+  */
+ 
+ /* Always declared so pcm_close/pcm_prepare can unconditionally manage
+@@ -55,7 +54,6 @@
+ #include <stdatomic.h>
+ #include <pthread.h>
+ #include <time.h>
+-#include <math.h>
+ #include <mach/mach.h>
+ #include <mach/mach_time.h>
+ #include <mach/thread_policy.h>
+@@ -63,8 +61,8 @@
+ /* cdj3k-emu: pin the bypass writer thread to a real-time scheduling band
+  * so macOS cannot preempt it during normal scheduling jitter. Without
+  * this, the writer's 1 ms polling wake-up could be delayed 5-15 ms
+- * under load, the bypass ring would drain a few IOProc cycles, and the
+- * IOProc would emit memset 0 - audible as the "little pops" the user
++ * under load, the transport ring would drain a few render cycles, and the
++ * native callback would emit silence - audible as the "little pops" the user
+  * was still seeing after the big-pop / xrun-recovery fix.
+  *
+  * Budget: period=2 ms, computation=0.5 ms, constraint=1 ms,
+@@ -134,143 +132,55 @@
+ static pthread_mutex_t vsnd_bypass_pending_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static _Atomic(VirtIOSound *) vsnd_writer_target;
+ 
+-/* Guest's negotiated PCM rate (e.g. 44100 or 96000). Stored on bypass
+- * activation; the resampler in vsnd_bypass_write_resampled() pairs this
+- * with the live HAL rate to compute the conversion ratio. */
+-static _Atomic uint32_t vsnd_bypass_guest_rate;
+-
+-/* Cubic-Hermite (Catmull-Rom) resampler state, mutated only by the
+- * writer thread (single producer = no concurrency). Persists across
+- * buffers so the resampler doesn't restart its phase on every
+- * guest-buffer hand-off. Reset to zero only on cold bypass activation
+- * (format change).
+- *
+- * Replaces the earlier linear-interpolation version. Linear was
+- * C0-continuous (value continuous, slope discontinuous) - each input
+- * frame boundary produced a slope jump that aliased into the audible
+- * band when the output rate was less than 2x the input rate. On a
+- * 44.1 kHz guest playing into a 48 kHz output device the aliasing
+- * showed up as a dense haze of vertical lines in the iZotope RX
+- * spectrogram. Cubic Hermite with Catmull-Rom tangents is C1
+- * continuous and the residual aliasing is 2-3 orders of magnitude
+- * smaller in the audible band. */
+-typedef struct {
+-    /* Sliding window of the last four input frames (per channel),
+-     * oldest at index 0, newest at index 3. The current output segment
+-     * lies between y[1] and y[2]; y[0] supplies the left tangent
+-     * neighbor and y[3] the right tangent neighbor. */
+-    float  y[4][2];   /* [time index 0..3][channel: 0=L, 1=R] */
+-    double frac;      /* [0, 1): fractional output position within segment [y[1], y[2]] */
+-
+-    /* 2nd-order Butterworth lowpass biquad state (per channel), used
+-     * as an anti-alias pre-filter when downsampling. Direct Form II
+-     * Transposed - two state vars per channel are sufficient. Reset
+-     * on cold start (memset of the whole struct). */
+-    float  biq_s1[2]; /* [channel 0=L, 1=R] */
+-    float  biq_s2[2];
+-
+-    /* Anti-alias coefficients depend only on the negotiated rate pair.
+-     * Cache them so the real-time writer does not repeat trigonometry for
+-     * every guest TX batch. A changed pair refreshes the cache without
+-     * disturbing the live filter delay state. */
+-    uint32_t biq_in_rate;
+-    uint32_t biq_out_rate;
+-    float biq_b0;
+-    float biq_b1;
+-    float biq_b2;
+-    float biq_a1;
+-    float biq_a2;
+-} VsndResamplerState;
+-static VsndResamplerState vsnd_resampler;
+-
+-/* Adaptive clock-skew correction (soft-PLL ratio adjustment).
+- *
+- * When the HAL device clock runs slightly slower than the guest's
+- * negotiated rate (typical of Apple Silicon's built-in audio vs. a
+- * pro USB DAC), the writer outpaces the reader and the ring would
+- * fill indefinitely. The earlier "drop a frame when over high-water"
+- * approach worked structurally but each dropped frame was a 1-sample
+- * discontinuity - inaudible per drop, but loud drops landing on a
+- * beat or transient still produced audible clicks (~20 per loop on
+- * the 48 kHz Built-in Headphone case).
+- *
+- * The current approach is a soft PLL: each call computes the ring
+- * depth error vs. a target depth, and applies a tiny proportional
+- * correction to the resampler ratio for that call. Over many calls,
+- * the writer's effective output rate converges on the reader's actual
+- * clock - no discrete drops, no clicks, just an imperceptible pitch
+- * adjustment of at most ±VSND_PLL_MAX_CORRECTION (~0.5%, comfortably
+- * below the audible threshold for music content).
+- *
+- * Target depth is in ms (rate-independent); the byte value is computed
+- * per call from the live HAL rate. 80 ms target keeps us comfortably
+- * below the guest watchdog threshold (~100 ms) while leaving headroom
+- * for host scheduling jitter. */
+-#define VSND_BYPASS_HIGH_WATER_MS 80
+-/* Integrator step per write call (per-call gain on normalized error).
+- * With ~100 writer calls/sec, 1e-6 means a 100% depth error nudges the
+- * integrator by 1e-4 per second - reaches the ±0.5% clamp in ~50s of
+- * sustained one-direction error. Slow enough to ignore short-term
+- * fluctuations from the writer/reader event cadence (which were
+- * producing audible pitch FM on the proportional-PLL version), fast
+- * enough to track real clock drift before the ring fills/empties. */
+-#define VSND_PLL_INTEGRATOR_STEP  1.0e-6
+-#define VSND_PLL_MAX_CORRECTION   0.005   /* clamp ratio adjust to ±0.5% */
+-
+-/* Accumulated PLL ratio correction. Mutated only by the writer thread
+- * (single producer = no concurrency). Reset to 0 only on cold bypass
+- * activation; persists across xrun-recovery prepare cycles so the
+- * pace-match state isn't thrown away on every guest watchdog fire. */
+-static double vsnd_pll_integrator;
+-
+-size_t virtio_snd_bypass_read(void *dst, size_t bytes);
+-size_t virtio_snd_bypass_avail(void);
+ int    virtio_snd_bypass_is_active(void);
+ 
+-/* SPSC ring between the virtio-snd writer pthread and CoreAudio's
+- * IOProc. Sized to keep ~170 ms of audio at 96 kHz F32 stereo
++/* SPSC ring between the virtio-snd writer pthread and the native mixer.
++ * Sized to keep ~170 ms of audio at 96 kHz F32 stereo
+  * (8 bytes/frame). Originally added because the writer was BQL-bound
+  * and could be stalled 10-15 ms by virtio-gpu / shm-display work on
+  * the same thread; the writer has since been moved to a dedicated
+  * Mach-RT pthread (vsnd_writer_thread_fn), but a generous ring is
+- * still useful to absorb HAL-side jitter and macOS scheduler
++ * still useful to absorb native-render jitter and macOS scheduler
+  * preemption tails on the worker. 128 KB = 96 KB extra resident memory
+  * per QEMU instance, trivial vs. the 1.5 GiB guest RAM. */
+ #define VSND_BYPASS_BYTES (128 * 1024)
+-static uint8_t  vsnd_local_ring[VSND_BYPASS_BYTES];
+-static _Atomic uint64_t vsnd_local_head;
+-static _Atomic uint64_t vsnd_local_tail;
+ static uint8_t *vsnd_external_ring;
+ static _Atomic uint64_t *vsnd_external_head;
+ static _Atomic uint64_t *vsnd_external_tail;
+-static _Atomic uint32_t *vsnd_external_rate;
++static _Atomic uint32_t *vsnd_external_source_rate;
+ static _Atomic uint32_t *vsnd_external_active;
+-#define vsnd_bypass_ring (vsnd_external_ring ? vsnd_external_ring : vsnd_local_ring)
+-#define vsnd_bypass_head (*(vsnd_external_head ? vsnd_external_head : &vsnd_local_head))
+-#define vsnd_bypass_tail (*(vsnd_external_tail ? vsnd_external_tail : &vsnd_local_tail))
++#define vsnd_bypass_ring (vsnd_external_ring)
++#define vsnd_bypass_head (*vsnd_external_head)
++#define vsnd_bypass_tail (*vsnd_external_tail)
+ static _Atomic int      vsnd_bypass_active;
+ static int              vsnd_bypass_src_fmt; /* AUDIO_FORMAT_F32 or _S32 */
+-static _Atomic uint64_t vsnd_bypass_underrun_frames;
+ static _Atomic uint64_t vsnd_bypass_overrun_count;
+ 
+ void virtio_snd_external_ring_configure(
+     void *ring, _Atomic uint64_t *head, _Atomic uint64_t *tail,
+-    _Atomic uint32_t *rate, _Atomic uint32_t *active);
++    _Atomic uint32_t *source_rate, _Atomic uint32_t *active);
+ void virtio_snd_external_ring_configure(
+     void *ring, _Atomic uint64_t *head, _Atomic uint64_t *tail,
+-    _Atomic uint32_t *rate, _Atomic uint32_t *active)
++    _Atomic uint32_t *source_rate, _Atomic uint32_t *active)
+ {
+     if (vsnd_external_active) {
+         atomic_store_explicit(vsnd_external_active, 0, memory_order_release);
+     }
++    if (vsnd_external_source_rate) {
++        atomic_store_explicit(vsnd_external_source_rate, 0,
++                              memory_order_release);
++    }
+     vsnd_external_ring = ring;
+     vsnd_external_head = head;
+     vsnd_external_tail = tail;
+-    vsnd_external_rate = rate;
++    vsnd_external_source_rate = source_rate;
+     vsnd_external_active = active;
+     if (ring && head && tail && active) {
+         atomic_store_explicit(tail, 0, memory_order_relaxed);
+         atomic_store_explicit(head, 0, memory_order_relaxed);
++        if (source_rate) {
++            atomic_store_explicit(source_rate, 0, memory_order_relaxed);
++        }
+         atomic_store_explicit(active, 1, memory_order_release);
+     }
+ }
+@@ -281,80 +191,8 @@
+     return vsnd_external_ring != NULL;
+ }
+ 
+-size_t virtio_snd_bypass_read(void *dst, size_t bytes)
+-{
+-    uint64_t t = atomic_load_explicit(&vsnd_bypass_tail, memory_order_relaxed);
+-    uint64_t h = atomic_load_explicit(&vsnd_bypass_head, memory_order_acquire);
+-    uint64_t avail = h - t;
+-    if (bytes > avail) bytes = avail;
+-    uint32_t off = (uint32_t)(t & (VSND_BYPASS_BYTES - 1));
+-    size_t first = MIN(bytes, VSND_BYPASS_BYTES - off);
+-    memcpy(dst, vsnd_bypass_ring + off, first);
+-    if (bytes > first) {
+-        memcpy((uint8_t *)dst + first, vsnd_bypass_ring, bytes - first);
+-    }
+-    atomic_store_explicit(&vsnd_bypass_tail, t + bytes, memory_order_release);
+-    return bytes;
+-}
+-
+-size_t virtio_snd_bypass_avail(void)
+-{
+-    uint64_t t = atomic_load_explicit(&vsnd_bypass_tail, memory_order_relaxed);
+-    uint64_t h = atomic_load_explicit(&vsnd_bypass_head, memory_order_acquire);
+-    return (size_t)(h - t);
+-}
+-
+-/* Record an underrun: the CoreAudio IOProc found the bypass ring empty
+- * and emitted silence for `frames` of audio. Called from the realtime
+- * audio thread; must be lock-free. The frame count is per-call (not
+- * cumulative within this fn). */
+-void virtio_snd_bypass_note_underrun(uint32_t frames);
+-void virtio_snd_bypass_note_underrun(uint32_t frames)
+-{
+-    atomic_fetch_add_explicit(&vsnd_bypass_underrun_frames,
+-                              (uint64_t)frames,
+-                              memory_order_relaxed);
+-}
+-
+-/* Snapshot the cumulative underrun-frame counter without resetting it.
+- * Exposed so a periodic logger / cfg-sock daemon can compute deltas. */
+-uint64_t virtio_snd_bypass_underrun_total_frames(void);
+-uint64_t virtio_snd_bypass_underrun_total_frames(void)
+-{
+-    return atomic_load_explicit(&vsnd_bypass_underrun_frames,
+-                                memory_order_relaxed);
+-}
+-
+-/* Same for overruns (writer found the ring full). Useful as a sanity
+- * check: if overruns are rising, the writer is faster than the reader
+- * and we're losing samples *before* the IOProc - typically a wrong-rate
+- * scenario where 96 kHz data is being fed to a 44.1 kHz IOProc. */
+-uint64_t virtio_snd_bypass_overrun_total(void);
+-uint64_t virtio_snd_bypass_overrun_total(void)
+-{
+-    return atomic_load_explicit(&vsnd_bypass_overrun_count,
+-                                memory_order_relaxed);
+-}
+-
+-extern uint32_t coreaudio_get_pipeline_depth_us(void);
+-extern uint32_t coreaudio_get_static_latency_frames(void);
+-extern unsigned coreaudio_get_active_samplerate(void);
+-
+-/* Public accessor: host-side pipeline depth DOWNSTREAM of the bypass ring
+- * - CoreAudio HAL queue + static device latency. Does NOT include the
+- * ring depth (already covered by guest frames_in_flight when deferred
+- * return is in effect). */
+-static uint32_t virtio_snd_bypass_depth_frames(void)
+-{
+-    uint32_t hal_us = coreaudio_get_pipeline_depth_us();
+-    uint32_t hal_rate = coreaudio_get_active_samplerate();
+-    uint32_t hal_frames = 0;
+-    if (hal_rate > 0)
+-        hal_frames = (uint32_t)(((uint64_t)hal_us * hal_rate) / 1000000ULL);
+-    uint32_t static_frames = coreaudio_get_static_latency_frames();
+-    return hal_frames + static_frames;
+-}
+-
++/* Overruns indicate that the source-rate ring filled before the native mixer
++ * could consume another batch. */
+ int virtio_snd_bypass_is_active(void)
+ {
+     return atomic_load_explicit(&vsnd_bypass_active, memory_order_acquire);
+@@ -365,8 +203,8 @@
+     return atomic_load_explicit(&vsnd_bypass_head, memory_order_relaxed);
+ }
+ 
+-/* Fast path: rates match (or HAL rate unknown). Convert vsnd_bypass_src_fmt
+- * input into F32 output 1:1 and stream into the ring. Returns bytes
++/* Convert vsnd_bypass_src_fmt input into source-rate F32 and stream it into
++ * the ring. Returns bytes
+  * written (== src_bytes) or 0 on ring-full (caller leaves buf in queue). */
+ static size_t vsnd_bypass_write_passthrough(const void *src, size_t src_bytes)
+ {
+@@ -404,268 +242,14 @@
+     return src_bytes;
+ }
+ 
+-/* Resampled path: cubic-Hermite (Catmull-Rom) interpolation from
+- * in_rate to out_rate, S32 or F32 input → F32 output. Runs on the
+- * writer thread (single producer), mutates vsnd_resampler state
+- * without locking.
+- *
+- * Cubic Hermite formula for output at fractional position t in [0, 1)
+- * within segment [y1, y2], using Catmull-Rom tangents from y0 and y3:
+- *
+- *   m1 = (y2 - y0) / 2
+- *   m2 = (y3 - y1) / 2
+- *   out = (2t³ - 3t² + 1) y1 + (t³ - 2t² + t) m1
+- *       + (-2t³ + 3t²)    y2 + (t³ - t²)       m2
+- *
+- * Implementation: maintain a 4-sample sliding window per channel.
+- * Each new input shifts the window left and pushes the input on the
+- * right; we emit zero or more output frames covering segment [y1, y2]
+- * while frac < 1, then `frac -= 1` to start the next segment.
+- *
+- * Adaptive clock-skew: at the top of each call we read the ring's
+- * current depth. If it's above the high-water mark, we skip one output
+- * frame this batch (drop_remaining = 1). The state still advances so
+- * the resampler phase stays correct; we just don't write that one
+- * output to the ring. Over many calls this bleeds off the drift that
+- * would otherwise fill the ring and trigger the guest's xrun watchdog.
+- *
+- * Worst-case output size for the up-front ring-space reservation:
+- *   ceil(in_frames * out_rate / in_rate) + 2 frames
+- * (each input can produce up to ceil(out_rate/in_rate) outputs, plus
+- * a tiny slack for fractional-phase rollover). */
+-static size_t vsnd_bypass_write_resampled(const void *src, size_t src_bytes,
+-                                          uint32_t in_rate, uint32_t out_rate)
+-{
+-    /* Both S32 stereo and F32 stereo are 8 bytes/frame. */
+-    size_t in_frames = src_bytes / 8;
+-    if (in_frames == 0 || in_rate == 0 || out_rate == 0) {
+-        return 0;
+-    }
+ 
+-    size_t max_out_frames =
+-        (size_t)(((uint64_t)in_frames * out_rate + (in_rate - 1)) / in_rate) + 2;
+-    size_t max_out_bytes = max_out_frames * 8;
+-
+-    uint64_t h = atomic_load_explicit(&vsnd_bypass_head, memory_order_relaxed);
+-    uint64_t t = atomic_load_explicit(&vsnd_bypass_tail, memory_order_acquire);
+-    uint64_t depth = h - t;
+-    uint64_t free = VSND_BYPASS_BYTES - depth;
+-    if (max_out_bytes > free) {
+-        atomic_fetch_add_explicit(&vsnd_bypass_overrun_count, 1,
+-                                  memory_order_relaxed);
+-        return 0;
+-    }
+-
+-    /* Integrator-only PLL for clock-skew correction. The previous
+-     * proportional-only version (correction = err * gain) reacted to
+-     * the natural ring-depth fluctuation from writer/reader event
+-     * cadence (writer pushes ~4KB bursts, reader drains ~2KB per
+-     * IOProc fire) and turned those fluctuations into audible pitch
+-     * FM artifacts (dense vertical lines in the spectrogram on the
+-     * stable-clock 96 kHz SMSL case). An integrator smooths over the
+-     * fluctuations: a positive error accumulates slowly until the
+-     * resampler's effective rate matches the reader's actual clock,
+-     * then sits there. Convergence takes seconds, but the steady
+-     * state is wobble-free.
+-     *
+-     * Sign convention: integrator > 0 means "ring is over target,
+-     * resampler should produce fewer outputs per input (larger ratio)
+-     * to drain". */
+-    int64_t target_bytes =
+-        (int64_t)(((uint64_t)out_rate * 8 * VSND_BYPASS_HIGH_WATER_MS) / 1000);
+-    int64_t err_bytes = (int64_t)depth - target_bytes;
+-    double  err_norm  = target_bytes > 0
+-                            ? (double)err_bytes / (double)target_bytes
+-                            : 0.0;
+-    vsnd_pll_integrator += err_norm * VSND_PLL_INTEGRATOR_STEP;
+-    if (vsnd_pll_integrator >  VSND_PLL_MAX_CORRECTION) {
+-        vsnd_pll_integrator =  VSND_PLL_MAX_CORRECTION;
+-    }
+-    if (vsnd_pll_integrator < -VSND_PLL_MAX_CORRECTION) {
+-        vsnd_pll_integrator = -VSND_PLL_MAX_CORRECTION;
+-    }
+-
+-    const bool   is_s32        = (vsnd_bypass_src_fmt == AUDIO_FORMAT_S32);
+-    const float  scale         = 1.0f / 2147483648.0f;
+-    const double nominal_ratio = (double)in_rate / (double)out_rate;
+-    const double ratio         = nominal_ratio * (1.0 + vsnd_pll_integrator);
+-
+-    /* Anti-alias pre-filter for downsample cases (in_rate > out_rate).
+-     * Without it, content between the output Nyquist (out_rate/2) and
+-     * the input Nyquist (in_rate/2) folds DOWN into the audible band.
+-     * For a 96 kHz guest feeding a 48 kHz HAL the relevant 24-48 kHz
+-     * zone in the input contains drum transients and DSP harmonics
+-     * that fold to 0-24 kHz as ghost frequencies (audible as a haze
+-     * of pops in the iZotope RX recording).
+-     *
+-     * 2nd-order Butterworth lowpass at 0.46 x out_rate kills most of
+-     * the foldback (-12 dB/oct above cutoff). Direct Form II
+-     * Transposed biquad, state and rate-pair coefficient cache in
+-     * vsnd_resampler. */
+-    bool  downsample = (in_rate > out_rate);
+-    if (vsnd_resampler.biq_in_rate != in_rate ||
+-        vsnd_resampler.biq_out_rate != out_rate) {
+-        vsnd_resampler.biq_in_rate = in_rate;
+-        vsnd_resampler.biq_out_rate = out_rate;
+-
+-        if (downsample) {
+-            double fc = 0.46 * (double)out_rate;
+-            double w0 = 2.0 * M_PI * fc / (double)in_rate;
+-            double cos_w0 = cos(w0);
+-            double sin_w0 = sin(w0);
+-            double Q = 0.70710678; /* Butterworth */
+-            double alpha = sin_w0 / (2.0 * Q);
+-            double a0 = 1.0 + alpha;
+-            vsnd_resampler.biq_b0 =
+-                (float)((1.0 - cos_w0) * 0.5 / a0);
+-            vsnd_resampler.biq_b1 =
+-                (float)((1.0 - cos_w0)       / a0);
+-            vsnd_resampler.biq_b2 = vsnd_resampler.biq_b0;
+-            vsnd_resampler.biq_a1 =
+-                (float)(-2.0 * cos_w0        / a0);
+-            vsnd_resampler.biq_a2 =
+-                (float)((1.0 - alpha)        / a0);
+-        } else {
+-            vsnd_resampler.biq_b0 = 0.0f;
+-            vsnd_resampler.biq_b1 = 0.0f;
+-            vsnd_resampler.biq_b2 = 0.0f;
+-            vsnd_resampler.biq_a1 = 0.0f;
+-            vsnd_resampler.biq_a2 = 0.0f;
+-        }
+-    }
+-    const float b0 = vsnd_resampler.biq_b0;
+-    const float b1 = vsnd_resampler.biq_b1;
+-    const float b2 = vsnd_resampler.biq_b2;
+-    const float a1 = vsnd_resampler.biq_a1;
+-    const float a2 = vsnd_resampler.biq_a2;
+-    /* Pull biquad state into locals so the hot loop stays register-
+-     * resident. Saved back at function exit. */
+-    float biq_s1_L = vsnd_resampler.biq_s1[0];
+-    float biq_s2_L = vsnd_resampler.biq_s2[0];
+-    float biq_s1_R = vsnd_resampler.biq_s1[1];
+-    float biq_s2_R = vsnd_resampler.biq_s2[1];
+-
+-    /* Load sliding-window state into locals so the inner loop stays
+-     * register-resident. */
+-    float y0_L = vsnd_resampler.y[0][0], y1_L = vsnd_resampler.y[1][0],
+-          y2_L = vsnd_resampler.y[2][0], y3_L = vsnd_resampler.y[3][0];
+-    float y0_R = vsnd_resampler.y[0][1], y1_R = vsnd_resampler.y[1][1],
+-          y2_R = vsnd_resampler.y[2][1], y3_R = vsnd_resampler.y[3][1];
+-    double frac = vsnd_resampler.frac;
+-
+-    size_t out_bytes = 0;
+-
+-    for (size_t i = 0; i < in_frames; i++) {
+-        /* Pull next input frame in either source format. */
+-        float new_L, new_R;
+-        if (is_s32) {
+-            const int32_t *isrc = (const int32_t *)src;
+-            new_L = (float)isrc[i * 2]     * scale;
+-            new_R = (float)isrc[i * 2 + 1] * scale;
+-        } else {
+-            const float *fsrc = (const float *)src;
+-            new_L = fsrc[i * 2];
+-            new_R = fsrc[i * 2 + 1];
+-        }
+-
+-        /* Anti-alias lowpass before the resampler sees the sample.
+-         * Direct Form II Transposed:
+-         *   y  = b0*x + s1
+-         *   s1 = b1*x - a1*y + s2
+-         *   s2 = b2*x - a2*y                                       */
+-        if (downsample) {
+-            float y_L = b0 * new_L + biq_s1_L;
+-            biq_s1_L  = b1 * new_L - a1 * y_L + biq_s2_L;
+-            biq_s2_L  = b2 * new_L - a2 * y_L;
+-            new_L = y_L;
+-
+-            float y_R = b0 * new_R + biq_s1_R;
+-            biq_s1_R  = b1 * new_R - a1 * y_R + biq_s2_R;
+-            biq_s2_R  = b2 * new_R - a2 * y_R;
+-            new_R = y_R;
+-        }
+-
+-        /* Shift window: oldest drops out the left, new sample enters
+-         * the right. After this the current output segment [y1, y2]
+-         * sits BEHIND the newest input - we always have one input of
+-         * lookahead for the cubic's right tangent. */
+-        y0_L = y1_L; y1_L = y2_L; y2_L = y3_L; y3_L = new_L;
+-        y0_R = y1_R; y1_R = y2_R; y2_R = y3_R; y3_R = new_R;
+-
+-        /* Emit zero or more output frames covering segment [y1, y2]
+-         * (down-sample ratios >1 may emit none for many input frames;
+-         * heavy up-sample emits many per input). */
+-        while (frac < 1.0) {
+-            float t_f = (float)frac;
+-            float t2  = t_f * t_f;
+-            float t3  = t2  * t_f;
+-
+-            float m1_L = 0.5f * (y2_L - y0_L);
+-            float m2_L = 0.5f * (y3_L - y1_L);
+-            float m1_R = 0.5f * (y2_R - y0_R);
+-            float m2_R = 0.5f * (y3_R - y1_R);
+-
+-            float h00 = 2.0f * t3 - 3.0f * t2 + 1.0f;
+-            float h10 = t3 - 2.0f * t2 + t_f;
+-            float h01 = -2.0f * t3 + 3.0f * t2;
+-            float h11 = t3 - t2;
+-
+-            float out_L = h00 * y1_L + h10 * m1_L + h01 * y2_L + h11 * m2_L;
+-            float out_R = h00 * y1_R + h10 * m1_R + h01 * y2_R + h11 * m2_R;
+-
+-            /* Per-frame ring wrap: L and R each get their own masked
+-             * position so the frame can straddle the ring's end
+-             * without a partial-frame split. */
+-            uint32_t pos_L = (uint32_t)((h + out_bytes) &
+-                                        (VSND_BYPASS_BYTES - 1));
+-            uint32_t pos_R = (uint32_t)((h + out_bytes + 4) &
+-                                        (VSND_BYPASS_BYTES - 1));
+-            memcpy(vsnd_bypass_ring + pos_L, &out_L, 4);
+-            memcpy(vsnd_bypass_ring + pos_R, &out_R, 4);
+-            out_bytes += 8;
+-            if (out_bytes + 8 > max_out_bytes) {
+-                /* Defensive: max_out_frames math should keep this
+-                 * unreachable, but cap any pathological case. */
+-                goto done;
+-            }
+-            frac += ratio;
+-        }
+-
+-        frac -= 1.0;
+-    }
+-
+-done:
+-    vsnd_resampler.y[0][0] = y0_L; vsnd_resampler.y[1][0] = y1_L;
+-    vsnd_resampler.y[2][0] = y2_L; vsnd_resampler.y[3][0] = y3_L;
+-    vsnd_resampler.y[0][1] = y0_R; vsnd_resampler.y[1][1] = y1_R;
+-    vsnd_resampler.y[2][1] = y2_R; vsnd_resampler.y[3][1] = y3_R;
+-    vsnd_resampler.frac    = frac;
+-    vsnd_resampler.biq_s1[0] = biq_s1_L; vsnd_resampler.biq_s2[0] = biq_s2_L;
+-    vsnd_resampler.biq_s1[1] = biq_s1_R; vsnd_resampler.biq_s2[1] = biq_s2_R;
+-
+-    atomic_store_explicit(&vsnd_bypass_head, h + out_bytes,
+-                          memory_order_release);
+-    return out_bytes;
+-}
+-
+-/* Entry point: dispatches to passthrough or resampled based on the
+- * live HAL rate vs the guest's negotiated rate (both cached as atomics,
+- * so this is lock-free on the hot path). All-or-nothing: returns 0 on
+- * ring-full so caller leaves buf in stream->queue for retry. */
++/* QEMU is a format converter and transport only. Preserve the guest frame
++ * rate in the ring; the singleton native mixer resamples all channels against
++ * the one hardware clock. All-or-nothing on ring-full keeps virtqueue
++ * completion aligned with actual transport consumption. */
+ static size_t vsnd_bypass_write_convert(const void *src, size_t src_bytes)
+ {
+-    uint32_t hal_rate = vsnd_external_rate
+-        ? atomic_load_explicit(vsnd_external_rate, memory_order_acquire)
+-        : coreaudio_get_active_samplerate();
+-    uint32_t guest_rate = atomic_load_explicit(&vsnd_bypass_guest_rate,
+-                                               memory_order_relaxed);
+-    if (hal_rate == 0 || guest_rate == 0 || hal_rate == guest_rate) {
+-        /* No resampling needed (or HAL rate not yet known: in that case
+-         * we fall through to passthrough as a best guess, which produces
+-         * pitch-shifted audio rather than silence). */
+-        return vsnd_bypass_write_passthrough(src, src_bytes);
+-    }
+-    return vsnd_bypass_write_resampled(src, src_bytes, guest_rate, hal_rate);
++    return vsnd_bypass_write_passthrough(src, src_bytes);
+ }
+ 
+ /* Deferred TX buffer return: each successful write records end_head in the
+@@ -704,7 +288,7 @@
+     pthread_mutex_unlock(&vsnd_bypass_pending_mutex);
+ }
+ 
+-/* Drain entries whose audio has already been consumed by the IOProc.
++/* Drain entries whose audio has already been consumed by the native mixer.
+  * Called from the main thread (drain timer) and from flush. Each entry
+  * release path calls virtio_notify which requires BQL, so this must run
+  * on BQL - we drain into a local list under the mutex, then release
+@@ -757,7 +341,7 @@
+  * available stream->queue buffers into the bypass ring. Stops on
+  * ring-full (buffer stays in queue for next pass). Does NOT call
+  * virtqueue_push / virtio_notify - those land on the pending list and
+- * the main thread reaps them when the IOProc has consumed the data. */
++ * the main thread reaps them when the native mixer has consumed the data. */
+ static bool vsnd_writer_drain_stream(VirtIOSoundPCMStream *stream)
+ {
+     WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
+@@ -787,7 +371,7 @@
+             }
+             if (vsnd_bypass_write_convert(buffer->data + buffer->offset,
+                                           buffer->size) == 0) {
+-                /* Ring full - leave the buffer in queue. The IOProc cannot
++                /* Ring full - leave the buffer in queue. The native callback cannot
+                  * signal space without adding a lock/syscall to its realtime
+                  * path, so ask the writer loop for a bounded timed retry. */
+                 return true;
+@@ -803,7 +387,7 @@
+ 
+ /* Publish work under the same mutex as the wait predicate. This makes a TX
+  * enqueue immediately before pthread_cond_wait visible to the waiter rather
+- * than becoming a lost wakeup. It is deliberately never called by IOProc. */
++ * than becoming a lost wakeup. It is never called by the native callback. */
+ static void vsnd_writer_wake(void)
+ {
+     pthread_mutex_lock(&vsnd_writer_mutex);
+@@ -910,7 +494,7 @@
+         pthread_mutex_unlock(&vsnd_writer_mutex);
+         fprintf(stderr,
+                 "virtio-snd: WARNING failed to spawn writer thread; "
+-                "using QEMU audio fallback\n");
++                "shared PCM transport unavailable\n");
+         return false;
+     }
+ }
+@@ -941,16 +525,11 @@
+ #define VSND_DRAIN_INTERVAL_MS 2
+ static QEMUTimer *vsnd_drain_timer;
+ 
+-/* Periodic xrun logger. Piggybacks on the drain timer (fires every 2 ms)
+- * and emits one stderr line per second iff the cumulative underrun /
+- * overrun counts changed since the last log. Lets the operator correlate
+- * audible pops to ring-empty events without spamming the log on a clean
+- * run. The HAL guest rate is what the IOProc samples at - we derive the
+- * underrun duration from it. */
++/* Periodic transport logger. Piggybacks on the drain timer and emits one
++ * stderr line per second only when the overrun count changes. */
+ static void vsnd_log_xruns_if_due(void)
+ {
+     static int64_t last_log_ms;
+-    static uint64_t last_underrun_frames;
+     static uint64_t last_overrun_count;
+ 
+     int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+@@ -959,27 +538,17 @@
+     }
+     last_log_ms = now;
+ 
+-    uint64_t uf = atomic_load_explicit(&vsnd_bypass_underrun_frames,
+-                                       memory_order_relaxed);
+     uint64_t oc = atomic_load_explicit(&vsnd_bypass_overrun_count,
+                                        memory_order_relaxed);
+-    uint64_t d_underrun = uf - last_underrun_frames;
+     uint64_t d_overrun = oc - last_overrun_count;
+-    last_underrun_frames = uf;
+     last_overrun_count = oc;
+ 
+-    if (d_underrun == 0 && d_overrun == 0) {
++    if (d_overrun == 0) {
+         return;
+     }
+-    unsigned rate = coreaudio_get_active_samplerate();
+-    if (rate == 0) rate = 96000;
+-    uint64_t d_underrun_us = (d_underrun * 1000000ULL) / rate;
+     fprintf(stderr,
+-            "virtio-snd: xrun report - underrun frames=%llu (~%llu us "
+-            "of silence in last second), overrun count=%llu (writer "
+-            "dropped batches)\n",
+-            (unsigned long long)d_underrun,
+-            (unsigned long long)d_underrun_us,
++            "virtio-snd: transport overrun count=%llu in the last second "
++            "(writer blocked on a full source ring)\n",
+             (unsigned long long)d_overrun);
+ }
+ 
+@@ -991,11 +560,8 @@
+  *      guest via virtqueue_push + virtio_notify. Those calls require
+  *      BQL, so the deferred-return reaper must live here.
+  *   2. vsnd_log_xruns_if_due - rate-limited periodic logger.
+- * The per-stream virtio_snd_pcm_out_cb call below is a no-op in
+- * bypass mode (the cb just calls pending_drain again, which is
+- * mutex-protected and idempotent) but stays for the AUD_write
+- * fallback path in case bypass is ever refused (a guest streaming
+- * unsupported format / channel count). */
++ * The per-stream virtio_snd_pcm_out_cb call below is a no-op while the
++ * transport is active; it reaps pending completions under BQL. */
+ static void vsnd_drain_timer_cb(void *opaque)
+ {
+     if (!atomic_load_explicit(&vsnd_bypass_active, memory_order_acquire))
+@@ -1017,28 +583,10 @@
+               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + VSND_DRAIN_INTERVAL_MS);
+ }
+ 
+-/* External signal that the host audio path is no longer valid for the
+- * currently active bypass (HAL rate change, default-device swap, output
+- * device teardown). Atomically flips bypass off; the next out_cb falls back
+- * to the AUD_write resampler path. Called from coreaudio.m HAL listeners,
+- * which run off-BQL - keep the body lock-free. */
+-void virtio_snd_bypass_invalidate(const char *reason);
+-void virtio_snd_bypass_invalidate(const char *reason)
+-{
+-    int prev = atomic_exchange_explicit(&vsnd_bypass_active, 0,
+-                                        memory_order_acq_rel);
+-    if (prev) {
+-        fprintf(stderr,
+-                "virtio-snd: CoreAudio bypass INVALIDATED - %s "
+-                "(falling back to mixer resampler)\n",
+-                reason ? reason : "unknown");
+-    }
+-}
+-
+-/* Bridge the IOProc's first few reads at bypass activation: the ring
+- * starts empty, the reader fires at HAL cadence (every ~2-5 ms), and
++/* Bridge the native callback's first few reads at activation: the ring
++ * starts empty, the reader fires at hardware cadence (every ~2-5 ms), and
+  * the writer needs several drain-timer cycles to produce its first
+- * burst of guest audio. Without a head-start the IOProc reads silence
++ * burst of guest audio. Without a head-start the native mixer reads silence
+  * and we count multiple warmup underruns. Pre-loading ~20 ms of silence
+  * means the reader has something safe to drain while the writer races
+  * to catch up; cost is 20 ms of leading silence which is inaudible
+@@ -1057,7 +605,7 @@
+          * Cold start (src_fmt different from cached, e.g. fmt==0 at boot,
+          * or genuine format change between sessions): old ring contents
+          * are not valid for the new stream interpretation, so we wipe and
+-         * pre-fill ~20 ms of zeros to give the IOProc a head-start while
++         * pre-fill ~20 ms of zeros to give the native mixer a head-start while
+          * the writer races to produce its first burst of guest audio.
+          *
+          * Warm re-activation (same fmt): triggered by guest sending
+@@ -1071,29 +619,20 @@
+          * / 8 bytes per frame / 44100 Hz) into the audible output. */
+         bool fmt_changed = (vsnd_bypass_src_fmt != src_fmt);
+         vsnd_bypass_src_fmt = src_fmt;
+-        atomic_store_explicit(&vsnd_bypass_guest_rate, guest_rate,
+-                              memory_order_relaxed);
++        if (vsnd_external_source_rate) {
++            atomic_store_explicit(vsnd_external_source_rate, guest_rate,
++                                  memory_order_release);
++        }
+         if (fmt_changed) {
+             atomic_store_explicit(&vsnd_bypass_tail, 0, memory_order_relaxed);
+             /* Zero the prefill region first - the ring memory is static
+              * and may hold stale data from a previous bypass session.
+              * Then publish head AFTER the zeros are visible so the
+-             * IOProc never reads garbage. */
++             * native mixer never reads garbage. */
+             memset(vsnd_bypass_ring, 0, vsnd_bypass_prefill_bytes);
+             atomic_store_explicit(&vsnd_bypass_head,
+                                   vsnd_bypass_prefill_bytes,
+                                   memory_order_release);
+-            /* Reset cubic-resampler sliding window on cold start - all
+-             * four taps go to silence so the first emitted output
+-             * interpolates from zero. The prefill zeros above provide
+-             * the clean lead-in for the IOProc; by the time the writer
+-             * actually produces audio the window has filled with real
+-             * input frames and the resampler is operating normally. */
+-            memset(&vsnd_resampler, 0, sizeof(vsnd_resampler));
+-            /* Reset PLL integrator too - format/rate changed, the old
+-             * accumulated correction would be wrong for the new clock
+-             * pair. Steady state is reached within seconds anyway. */
+-            vsnd_pll_integrator = 0.0;
+         }
+         if (!vsnd_drain_timer) {
+             vsnd_drain_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+@@ -1102,8 +641,7 @@
+         timer_mod(vsnd_drain_timer,
+                   qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + VSND_DRAIN_INTERVAL_MS);
+         /* Spawn (or re-point) the BQL-independent writer thread now that
+-         * the ring is published. Refuse bypass if no writer is available;
+-         * the regular QEMU audio path remains a clean fallback. */
++         * the ring is published. Preparation fails if no writer is available. */
+         if (!vsnd_drain_target_dev ||
+             !vsnd_writer_thread_start(vsnd_drain_target_dev)) {
+             on = 0;
+@@ -1119,6 +657,10 @@
+             timer_del(vsnd_drain_timer);
+         }
+         vsnd_bypass_pending_flush();
++        if (vsnd_external_source_rate) {
++            atomic_store_explicit(vsnd_external_source_rate, 0,
++                                  memory_order_release);
++        }
+     }
+     int prev = atomic_exchange_explicit(&vsnd_bypass_active, on,
+                                         memory_order_acq_rel);
+@@ -1128,8 +670,8 @@
+         vsnd_writer_wake();
+     }
+     if (prev != on) {
+-        fprintf(stderr, "virtio-snd: CoreAudio bypass %s (fmt=%d)\n",
+-                on ? "ENABLED" : "DISABLED", src_fmt);
++        fprintf(stderr, "virtio-snd: shared PCM transport %s (fmt=%d, rate=%u)\n",
++                on ? "ENABLED" : "DISABLED", src_fmt, guest_rate);
+     }
+ }
+ #else
+@@ -1150,7 +692,7 @@
+ static inline uint32_t virtio_snd_bypass_depth_frames(void) { return 0; }
+ static inline void vsnd_writer_wake(void) {}
+ #endif /* CONFIG_DARWIN */
+-/* ============= /CoreAudio bypass ring ============= */
++/* ============= /Native-mixer PCM transport ============= */
+ 
+ static uint32_t supported_formats = BIT(VIRTIO_SND_PCM_FMT_S8)
+                                   | BIT(VIRTIO_SND_PCM_FMT_U8)
+@@ -1222,13 +764,11 @@
+     cpu_to_le32s(&sndconfig->streams);
+     cpu_to_le32s(&sndconfig->chmaps);
+ 
+-    /* Extra field at offset sizeof(virtio_snd_config): pipeline_extra_frames.
+-     * Frame depth of host pipeline downstream of QEMU virtio queue
+-     * (CoreAudio HAL + static device latency). Read by guest's
+-     * audio_latency_ms sysfs. */
++    /* The first extension word used to contain a QEMU/CoreAudio-derived host
++     * latency estimate. QEMU no longer owns a host device, so publish zero;
++     * the native mixer reports the real HAL components directly to the UI. */
+     {
+-        uint32_t extra = virtio_snd_bypass_depth_frames();
+-        uint32_t le = cpu_to_le32(extra);
++        uint32_t le = 0;
+         memcpy(config + sizeof(virtio_snd_config), &le, sizeof(le));
+         le = cpu_to_le32(s->tx_batch_periods);
+         memcpy(config + sizeof(virtio_snd_config) + sizeof(le), &le, sizeof(le));
+@@ -1621,22 +1161,25 @@
+         }
+         audio_be_set_volume_out_lr(s->audio_be, stream->voice.out, 0, 255, 255);
+ 
+-        /* Activate CoreAudio bypass for any S32/F32 stereo guest stream,
+-         * regardless of HAL rate. The bypass writer thread resamples
+-         * (linear interpolation) when guest_rate != hal_rate, so we no
+-         * longer need to refuse on mismatch and fall back to QEMU's
+-         * AUD_write mixer (which had its own glitchy resampler). The
+-         * resampler runs off-BQL in the writer thread, keeping the
+-         * lock-free IOProc path intact. */
+-        bool bypass_ok = (as.nchannels == 2 &&
++        /* The shared ring is the only supported output path. QEMU converts
++         * S32 to F32 when necessary but preserves the guest sample rate for
++         * the native mixer's per-channel resampler. */
++        bool bypass_ok = (virtio_snd_external_ring_is_active() &&
++                          as.nchannels == 2 &&
+                           (as.fmt == AUDIO_FORMAT_F32 ||
+                            as.fmt == AUDIO_FORMAT_S32));
+         if (bypass_ok) {
+             vsnd_drain_target_dev = s;
+             virtio_snd_bypass_set_active(1, as.fmt, (uint32_t)as.freq);
+-        } else {
++            bypass_ok = virtio_snd_bypass_is_active();
++        }
++        if (!bypass_ok) {
+             vsnd_drain_target_dev = NULL;
+             virtio_snd_bypass_set_active(0, 0, 0);
++            audio_be_close_out(s->audio_be, stream->voice.out);
++            stream->voice.out = NULL;
++            error_report("virtio-snd: shared PCM transport is unavailable or stream format is unsupported");
++            return cpu_to_le32(VIRTIO_SND_S_IO_ERR);
+         }
+     } else {
+         stream->voice.in = audio_be_open_in(s->audio_be,
+@@ -1649,58 +1192,6 @@
+     }
+ 
+     return cpu_to_le32(VIRTIO_SND_S_OK);
+-}
+-
+-/* Recreate the host voice without resetting the virtio device or guest. The
+- * guest-visible stream object, negotiated parameters and START/STOP state stay
+- * intact. Closing first also stops the bypass writer and flushes outstanding
+- * completions before CoreAudio is reopened. */
+-static void virtio_snd_audio_reset(void *opaque, Error **errp)
+-{
+-    VirtIOSound *s = opaque;
+-    bool found_output = false;
+-
+-    for (uint32_t i = 0; i < s->snd_conf.streams; i++) {
+-        VirtIOSoundPCMStream *stream = s->pcm.streams[i];
+-        bool was_active;
+-        uint32_t status;
+-
+-        if (!stream || stream->info.direction != VIRTIO_SND_D_OUTPUT) {
+-            continue;
+-        }
+-        found_output = true;
+-        WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
+-            was_active = stream->active;
+-        }
+-
+-        virtio_snd_pcm_close(stream);
+-        status = virtio_snd_pcm_prepare(s, i);
+-        if (status != cpu_to_le32(VIRTIO_SND_S_OK)) {
+-            /* Keep the guest lifecycle state for a later retry. With no host
+-             * voice, audio_be_write safely returns zero and leaves queued TX
+-             * buffers intact instead of advancing or dropping them. */
+-            WITH_QEMU_LOCK_GUARD(&stream->queue_mutex) {
+-                stream->active = was_active;
+-            }
+-            error_setg(errp,
+-                       "Could not reopen virtio-sound stream %"PRIu32
+-                       " (status 0x%08"PRIx32")",
+-                       i, le32_to_cpu(status));
+-            return;
+-        }
+-
+-        /* pcm_prepare intentionally does not alter the guest lifecycle state.
+-         * Reapply it to the new software voice so a playing deck resumes as
+-         * soon as CoreAudio starts, while a stopped deck remains stopped. */
+-        audio_be_set_active_out(s->audio_be, stream->voice.out, was_active);
+-        if (was_active) {
+-            vsnd_writer_wake();
+-        }
+-    }
+-
+-    if (!found_output) {
+-        error_setg(errp, "No virtio-sound output stream is available to reset");
+-    }
+ }
+ 
+ static const char *print_code(uint32_t code)
+@@ -2151,7 +1642,7 @@
+     /* cdj3k-emu: drive out_cb synchronously once so the buffers we just
+      * enqueued drain (and ack to the guest) within microseconds instead
+      * of waiting up to ~10ms for the next QEMU mixer timer tick.
+-     * Critical for the CoreAudio bypass path with shallow guest TX_BUFS.
++     * Critical for the shared transport path with shallow guest TX_BUFS.
+      * The non-bypass audio_be_write path is idempotent under early
+      * invocation, so this is safe to do unconditionally. */
+     {
+@@ -2367,8 +1858,6 @@
+         }
+     }
+ 
+-    audio_register_reset_handler(virtio_snd_audio_reset, vsnd);
+-
+     return;
+ 
+ error_cleanup:
+@@ -2420,7 +1909,7 @@
+      * pulls bufs from stream->queue and pushes them into the SPSC ring
+      * off-BQL, so main-thread preemption cannot stall the ring refill.
+      * Here on the BQL path we only reap completed bufs (whose audio the
+-     * IOProc has already consumed) from the pending list and ack them
++     * native mixer has already consumed) from the pending list and ack them
+      * back to the guest. virtio_notify requires BQL, so reaping has to
+      * stay on the main thread; the worker only adds to pending, never
+      * touches the virtqueue completion side. */
+@@ -2606,7 +2095,7 @@
+          * here, despite an earlier version that did. The ring-drain was
+          * what produced the long flat silence segments visible in the
+          * iZotope RX "big pop" recordings (~170 ms at 96 kHz, ~370 ms
+-         * at 44.1 kHz). Leaving the ring full lets the IOProc keep
++         * at 44.1 kHz). Leaving the ring full lets the native mixer keep
+          * playing the in-flight audio while the writer is busy
+          * producing the guest's recovered stream behind it; the
+          * transition between old-ring audio and new-writer audio is at
+@@ -2627,7 +2116,6 @@
+     VirtIOSound *vsnd = VIRTIO_SND(dev);
+     VirtIOSoundPCMStream *stream;
+ 
+-    audio_unregister_reset_handler(virtio_snd_audio_reset, vsnd);
+     qemu_del_vm_change_state_handler(vsnd->vmstate);
+     trace_virtio_snd_unrealize(vsnd);
+ 

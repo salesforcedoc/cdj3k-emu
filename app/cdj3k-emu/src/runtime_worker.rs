@@ -9,7 +9,7 @@ use cdj3k_emu_platform::menu_state::{APP_SHUTDOWN, NO_USB_MOUNTED};
 use cdj3k_emu_platform::menu_state;
 use cdj3k_emu_runtime::{
     register_worker_thread, CfgClient, DiskProvider, MacOsDiskProvider, QemuConfig, QemuInstance,
-    SocketVmnet, TapBridge, UsbManager,
+    SocketVmnet, TapBridge, UsbManager, UsbSaveState,
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -61,6 +61,11 @@ fn run(mut instance: Option<QemuInstance>, mut config: QemuConfig, prebuilt_net:
     // Latched per QEMU lifetime - cleared on restart so a fresh kernel module
     // load gets the user's persisted ALC value pushed once cfg.sock is up.
     let mut alc_pushed_for_boot = false;
+
+    // The last USB Save report from the guest. A change in it is how a QEMU
+    // restart is told from a steady state -- the flag it describes lives in the
+    // guest's tmpfs and does not survive one.
+    let mut usbsave_last_report: Option<UsbSaveState> = None;
     // QEMU's send-key command uses a timed input queue. Keep our own bounded
     // queue and feed it one character per worker tick so large clipboard
     // pastes cannot overflow QEMU's 1024-event queue or leave Shift stuck.
@@ -146,6 +151,8 @@ fn run(mut instance: Option<QemuInstance>, mut config: QemuConfig, prebuilt_net:
                 usb_eject: std::mem::take(&mut s.usb_eject_req),
                 usb_phys_toggle: std::mem::replace(&mut s.usb_phys_toggle_idx, NO_USB_MOUNTED),
                 usb_phys_retry: std::mem::take(&mut s.usb_phys_retry_req),
+                usbsave_send: std::mem::take(&mut s.usbsave_send_req),
+                usbsave_armed: s.usbsave_armed,
                 audio_enabled: s.audio_enabled,
                 audio_device_uid: s.audio_device_uid.clone(),
                 cue_a_device_uid: s.cue_a_device_uid.clone(),
@@ -310,6 +317,56 @@ fn run(mut instance: Option<QemuInstance>, mut config: QemuConfig, prebuilt_net:
                 eprintln!("cdj3k-emu: initial set audio_sync_enabled failed: {e}");
             } else {
                 alc_pushed_for_boot = true;
+            }
+        }
+
+        // ── USB Save ─────────────────────────────────────────────────────────
+        // One bit and a small enum cross to the guest; the audio never does,
+        // because the guest writes it straight to the stick.
+        //
+        // Pushed when the panel's controls change, AND when the guest's report
+        // disagrees with what the host last knew about it.  The second case is
+        // the one that matters: the flag lives in the guest's /run, which is
+        // tmpfs, so every QEMU restart wipes it and cfgd comes back reporting
+        // "off" while the panel's switch is still on.  Without reconciling, the
+        // box would have to be toggled off and on again after every restart to
+        // mean anything.
+        //
+        // Re-sending is keyed on the report CHANGING, not on it merely
+        // disagreeing, so a guest that cannot write the flag (no /run) settles
+        // after one attempt instead of being retried twenty times a second.
+        {
+            let reported = cfg_client.usbsave_state();
+            if reported != usbsave_last_report {
+                usbsave_last_report = reported;
+                let agrees = reported == Some(UsbSaveState {
+                    armed: req.usbsave_armed,
+                });
+                if !agrees {
+                    if let Err(e) = cfg_client.usbsave(req.usbsave_armed) {
+                        eprintln!("cdj3k-emu: usbsave push failed: {e}");
+                    }
+                }
+            } else if req.usbsave_send {
+                if let Err(e) = cfg_client.usbsave(req.usbsave_armed) {
+                    eprintln!("cdj3k-emu: usbsave push failed: {e}");
+                }
+            }
+
+            // Mirror what the guest says, so the panel shows the state that took
+            // effect rather than the one that was asked for.
+            if let Some(state) = reported {
+                menu_state::lock().usbsave_reported = Some(menu_state::UsbSaveState {
+                    armed: state.armed,
+                });
+            }
+
+            // What the mods last wrote, relayed by cfgd. Pushed into the panel so
+            // a save can be checked without mounting the live USB image -- the
+            // host has no other way to read the medium.
+            let last = cfg_client.usbsave_last();
+            if last.is_some() && last != menu_state::lock().usbsave_last {
+                menu_state::lock().usbsave_last = last;
             }
         }
 
@@ -666,6 +723,8 @@ struct Requests {
     usb_eject: bool,
     usb_phys_toggle: i32,
     usb_phys_retry: bool,
+    usbsave_send: bool,
+    usbsave_armed: bool,
     audio_enabled: bool,
     audio_device_uid: Option<String>,
     cue_a_device_uid: Option<String>,
@@ -723,8 +782,7 @@ where
 
 /// Clear USB manager and mounted-state fields after any QEMU restart.
 /// The new QEMU instance always starts with the placeholder; nothing is mounted.
-fn reset_usb(usb: &mut UsbManager, config: &QemuConfig, cfg: &CfgClient) {
-    *usb = UsbManager::new(config.usb_placeholder_path(), cfg.clone());
+fn reset_usb(usb: &mut UsbManager, config: &QemuConfig, cfg: &CfgClient) {    *usb = UsbManager::new(config.usb_placeholder_path(), cfg.clone());
     let mut s = menu_state::lock();
     s.usb_virtual_mounted = false;
     s.usb_phys_mounted_idx = NO_USB_MOUNTED;

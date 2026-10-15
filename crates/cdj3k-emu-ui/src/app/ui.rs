@@ -161,6 +161,13 @@ pub struct DebugSnapshot {
     pub led_frame: [u8; 64],
     pub audio: AudioDebugSnapshot,
     pub prolink: Option<cdj3k_emu_platform::menu_state::ProlinkTrackStatus>,
+    /// USB Save control state, as the host has it.
+    pub usbsave_armed: bool,
+    /// What the guest last said, which is `None` until it answers at all.
+    pub usbsave_reported: Option<cdj3k_emu_platform::menu_state::UsbSaveState>,
+    /// The last save the mods reported, relayed by cfgd: the fields written into
+    /// the file. `None` until something has been saved this boot.
+    pub usbsave_last: Option<String>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -194,6 +201,9 @@ impl Default for DebugSnapshot {
             led_frame: [0u8; 64],
             audio: AudioDebugSnapshot::default(),
             prolink: None,
+            usbsave_armed: false,
+            usbsave_reported: None,
+            usbsave_last: None,
         }
     }
 }
@@ -260,6 +270,74 @@ pub(super) fn draw_debug_content(
     }
     if let Some(error) = &capture_status.error {
         ui.colored_label(egui::Color32::LIGHT_RED, format!("capture error: {error}"));
+    }
+    ui.separator();
+
+    // ---- USB Save ----
+    // The switch is the host's intent; the line under it is the guest's answer.
+    // They are shown apart on purpose: with the mods off, nothing in the guest
+    // reads the flag at all, so an armed toggle on its own would be a claim the
+    // host cannot make.
+    {
+        ui.label(
+            egui::RichText::new("USB Save")
+                .font(mono.clone())
+                .strong(),
+        );
+        let mut armed = snap.usbsave_armed;
+        let mut changed = false;
+        ui.add_enabled_ui(snap.audio.qemu_running, |ui| {
+            changed |= ui
+                .checkbox(&mut armed, "Write each loaded track to USB_SAVE/")
+                .changed();
+        });
+        match snap.usbsave_reported {
+            Some(reported) if reported.armed => {
+                ui.label(
+                    egui::RichText::new("guest: armed - writing on every load")
+                        .font(mono.clone())
+                        .color(egui::Color32::LIGHT_GREEN),
+                );
+            }
+            Some(_) => {
+                ui.label(egui::RichText::new("guest: off").font(mono.clone()));
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new("guest: no reply - EP122 Mods off?")
+                        .font(mono.clone())
+                        .color(egui::Color32::GRAY),
+                );
+            }
+        }
+        // What the mods last wrote, relayed by cfgd. The host cannot read the
+        // stick without mounting the live image, so this is how a save is checked.
+        ui.label(
+            egui::RichText::new("last save")
+                .font(mono.clone())
+                .strong(),
+        );
+        match &snap.usbsave_last {
+            Some(line) => {
+                ui.label(
+                    egui::RichText::new(line)
+                        .font(mono.clone())
+                        .color(egui::Color32::LIGHT_GREEN),
+                );
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new("none yet this boot")
+                        .font(mono.clone())
+                        .color(egui::Color32::GRAY),
+                );
+            }
+        }
+        if changed {
+            let mut state = cdj3k_emu_platform::menu_state::lock();
+            state.usbsave_armed = armed;
+            state.usbsave_send_req = true;
+        }
     }
     ui.separator();
 
@@ -529,7 +607,8 @@ pub(super) fn draw_debug_content(
 impl CdjApp {
     /// Builds a fresh [`DebugSnapshot`] from the current app state.
     pub(super) fn debug_snapshot(&self) -> DebugSnapshot {
-        let (instance_id, reported_latency_ms, tuning, qemu_running, audio_enabled, prolink) = {
+        let (instance_id, reported_latency_ms, tuning, qemu_running, audio_enabled, prolink,
+             usbsave_armed, usbsave_reported, usbsave_last) = {
             let state = cdj3k_emu_platform::menu_state::lock();
             (
                 state.current_instance_id,
@@ -538,6 +617,9 @@ impl CdjApp {
                 state.qemu_running,
                 state.audio_enabled,
                 state.prolink_track_status.clone(),
+                state.usbsave_armed,
+                state.usbsave_reported,
+                state.usbsave_last.clone(),
             )
         };
         let (
@@ -559,6 +641,9 @@ impl CdjApp {
             last_miso: self.last_miso,
             led_frame: self.led_state.frame,
             prolink,
+            usbsave_armed,
+            usbsave_reported,
+            usbsave_last,
             audio: AudioDebugSnapshot {
                 reported_latency_ms,
                 qemu_running,

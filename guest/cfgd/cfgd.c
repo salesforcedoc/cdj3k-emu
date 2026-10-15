@@ -14,12 +14,25 @@
  *                               lazy-umount /media/usb/sd* and emit usb_state 0
  *     set <name> <value>      - write <value> to a whitelisted sysfs param
  *     get <name>              - emit a `param <name> <value>` response
+ *     usbsave on <flac|wav>   - arm USB Save for the EP122 mods
+ *     usbsave off             - disarm it
  *
  *   guest → host
  *     usb_state <0|1>         - emitted by cfgd in response to SIGUSR1/SIGUSR2
  *                               from the USB hook scripts (see below)
  *     param <name> <value>    - response to get or unsolicited push
  *     latency <g>,<h>,<t>     - pushed every LATENCY_PERIOD_MS
+ *     usbsave_state <on|off> <flac|wav> - the state cfgd actually holds
+ *     usbsave_saved <line>    - relayed from /run/cdj3k-usbsave-last: the summary
+ *                               of the last track the mods wrote to the stick, so
+ *                               the Debug panel can show what was saved without
+ *                               the host mounting the live USB image
+ *
+ * USB Save reaches the mods as a FILE rather than as a message, because the mods
+ * run inside EP122 and cannot open this port: cfgd holds it O_RDWR, and a second
+ * opener gets EBUSY (the same constraint the USB hook scripts work around with
+ * signals). /run is tmpfs, so the flag is gone at every boot, which is the
+ * wanted default -- see the note on the flag path below.
  *
  * Signal IPC from in-guest scripts:
  *
@@ -51,6 +64,11 @@
 #include <unistd.h>
 
 #define LATENCY_PERIOD_MS 3000
+
+/* How often the loop may sleep while waiting for host input, so a save the mods
+ * have just finished is relayed to the panel promptly rather than up to a whole
+ * latency period later. */
+#define USBSAVE_POLL_MS 500
 
 #define VPORT_NAME       "cdj3k.cfg"
 #define VPORT_SYS_GLOB   "/sys/class/virtio-ports/"
@@ -105,7 +123,7 @@ static int open_port_blocking(void)
 static void emit(const char *fmt, ...)
 {
     if (g_port_fd < 0) return;
-    char buf[512];
+    char buf[1024];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -117,6 +135,65 @@ static void emit(const char *fmt, ...)
     }
     ssize_t w = write(g_port_fd, buf, (size_t)n);
     (void)w;
+}
+
+/* ---- USB Save -------------------------------------------------------------
+ *
+ * The mods poll this file; its presence is the whole of the signal. /run is
+ * tmpfs and wiped on every boot, so it cannot outlive a session and quietly
+ * re-arm a capture against a deck nobody armed. The contents are the container
+ * name, read by the mod as-is, so adding a third one needs no protocol change.
+ */
+#define USBSAVE_FLAG "/run/cdj3k-usbsave"
+
+/* Last container in force. Kept across `off` so re-arming does not silently
+ * switch format back to the default. */
+static char g_usbsave_format[8] = "flac";
+
+static void handle_usbsave(const char *arg)
+{
+    char verb[8] = { 0 };
+    char fmt[8] = { 0 };
+    int on;
+
+    if (sscanf(arg, "%7s %7s", verb, fmt) < 1)
+        return;
+
+    if (strcmp(verb, "on") == 0) {
+        on = 1;
+        if (strcmp(fmt, "flac") != 0 && strcmp(fmt, "wav") != 0) {
+            /* No container named, or one we do not know: keep the last, rather
+             * than writing a name the mod would have to guess at. */
+            memcpy(fmt, g_usbsave_format, sizeof(fmt));
+            fmt[sizeof(fmt) - 1] = '\0';
+        }
+    } else if (strcmp(verb, "off") == 0) {
+        on = 0;
+    } else {
+        fprintf(stderr, "cfgd: usbsave expects 'on <flac|wav>' or 'off'\n");
+        return;
+    }
+
+    if (on) {
+        FILE *fp = fopen(USBSAVE_FLAG, "w");
+        if (!fp) {
+            /* /run missing or read-only: say so rather than reporting a state
+             * the mods will never see. */
+            fprintf(stderr, "cfgd: cannot arm USB Save: %s\n", strerror(errno));
+            emit("usbsave_state off %s", g_usbsave_format);
+            return;
+        }
+        fputs(fmt, fp);
+        fclose(fp);
+    } else {
+        unlink(USBSAVE_FLAG);
+    }
+
+    if (on) {
+        memcpy(g_usbsave_format, fmt, sizeof(g_usbsave_format));
+        g_usbsave_format[sizeof(g_usbsave_format) - 1] = '\0';
+    }
+    emit("usbsave_state %s %s", on ? "on" : "off", g_usbsave_format);
 }
 
 static const struct param_def *find_param(const char *name)
@@ -285,11 +362,49 @@ static void dispatch_line(char *line)
         handle_set(line + 4);
     } else if (strncmp(line, "get ", 4) == 0) {
         handle_get(line + 4);
+    } else if (strncmp(line, "usbsave ", 8) == 0) {
+        handle_usbsave(line + 8);
     } else if (strcmp(line, "ping") == 0) {
         emit("pong");
     } else {
         fprintf(stderr, "cfgd: unknown command '%s'\n", line);
     }
+}
+
+/* ---- the last save, relayed to the host ------------------------------------
+ *
+ * The EP122 mods cannot write this port (cfgd holds it O_RDWR), so a completed
+ * save is left in a file in /run and relayed from here instead -- the same
+ * file-based route the arm flag takes in the other direction. It exists so the
+ * Debug panel can show what was written without the host mounting the live USB
+ * image, which is the thing that causes trouble.
+ *
+ * The line is relayed only when it CHANGES, so the panel is not fed the same
+ * summary three times a second. */
+#define USBSAVE_LAST "/run/cdj3k-usbsave-last"
+
+/* Long enough for the longest summary the mods write; see track_save.c. */
+static char g_last_save[1024];
+
+static void push_last_save(void)
+{
+    char buf[1024];
+    int fd = open(USBSAVE_LAST, O_RDONLY);
+    ssize_t n;
+    char *nl;
+
+    if (fd < 0) return;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = '\0';
+    nl = strchr(buf, '\n');                 /* one line, whatever is in the file */
+    if (nl) *nl = '\0';
+    if (buf[0] == '\0' || strcmp(buf, g_last_save) == 0)
+        return;
+    memcpy(g_last_save, buf, sizeof(g_last_save));
+    g_last_save[sizeof(g_last_save) - 1] = '\0';
+    emit("usbsave_saved %s", buf);
 }
 
 static void push_latency(void)
@@ -316,6 +431,12 @@ int main(void)
 
     /* Initial state push so the host doesn't have to query immediately. */
     push_latency();
+    /* ...including USB Save, so the panel shows "off" rather than "no reply"
+     * before the user has touched anything. */
+    {
+        int armed = access(USBSAVE_FLAG, F_OK) == 0;
+        emit("usbsave_state %s %s", armed ? "on" : "off", g_usbsave_format);
+    }
 
     char rx[1024];
     size_t rx_n = 0;
@@ -331,6 +452,11 @@ int main(void)
         long now = now_ms();
         long timeout = next_push - now;
         if (timeout < 0) timeout = 0;
+        if (timeout > USBSAVE_POLL_MS) timeout = USBSAVE_POLL_MS;
+
+        /* Before poll(), so a summary left by the mods since the last pass goes out
+         * even when the host is saying nothing. */
+        push_last_save();
 
         struct pollfd pfd = { .fd = g_port_fd, .events = POLLIN };
         int pr = poll(&pfd, 1, (int)timeout);

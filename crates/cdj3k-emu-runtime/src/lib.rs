@@ -15,7 +15,7 @@ pub mod vmnet;
 /// `cdj3k-emu-runtime` don't need a second `use` line.
 pub use cdj3k_emu_platform::runtime_paths;
 
-pub use cfg::{CfgClient, Latency};
+pub use cfg::{CfgClient, Latency, UsbSaveState};
 pub use config::QemuConfig;
 pub use instance::{
     cleanup_qemu_files, cleanup_runtime_files, kill_qemu_child, kill_qemu_child_now, InstanceError,

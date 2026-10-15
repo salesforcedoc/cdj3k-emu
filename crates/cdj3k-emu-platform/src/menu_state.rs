@@ -192,6 +192,16 @@ pub struct PhysicalDisk {
     pub label: String,
 }
 
+/// What the guest last reported about USB Save (mirrors
+/// cdj3k_emu_runtime::cfg::UsbSaveState).
+///
+/// Only the armed bit: the copy keeps the source's own container, so there is no
+/// format to choose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UsbSaveState {
+    pub armed: bool,
+}
+
 /// A CoreAudio output device exposed in the per-instance "Audio Output" picker.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioOutDevice {
@@ -374,6 +384,20 @@ pub struct AppState {
     pub usb_phys_perm_denied: bool,
     /// Set by the alert "Retry" button; runtime worker re-fires the toggle.
     pub usb_phys_retry_req: bool,
+
+    // ── USB Save ────────────────────────────────────────────────────────────
+    /// The host's switch, as the Debug panel shows it.
+    pub usbsave_armed: bool,
+    /// One-shot: raised by the panel when the armed bit changes, and consumed by
+    /// the runtime worker, which pushes it to the guest.
+    pub usbsave_send_req: bool,
+    /// What the guest says it is doing, which can differ from what was asked:
+    /// with the mods off, nothing in the guest reads the flag at all.
+    pub usbsave_reported: Option<UsbSaveState>,
+    /// The last save the mods reported, as cfgd relayed it: the fields written
+    /// into the file. Shown in the panel so a save can be checked without mounting
+    /// the live USB image.
+    pub usbsave_last: Option<String>,
 }
 
 impl AppState {
@@ -435,6 +459,10 @@ impl AppState {
             usb_phys_list_version: 0,
             usb_phys_perm_denied: false,
             usb_phys_retry_req: false,
+            usbsave_armed: false,
+            usbsave_send_req: false,
+            usbsave_reported: None,
+            usbsave_last: None,
         }
     }
 }

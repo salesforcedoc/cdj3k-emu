@@ -27,3 +27,7 @@ app/cdj3k-emu/assets/*
 !app/cdj3k-emu/assets/icon*
 !app/cdj3k-emu/assets/*.icns
 !app/cdj3k-emu/assets/*.otf
+
+# The firmware image and its key are not repo content: 144 MB, and the key is a
+# secret. Both belong on disk, beside the build, and neither is ever committed.
+CDJ3Kv314.UPD

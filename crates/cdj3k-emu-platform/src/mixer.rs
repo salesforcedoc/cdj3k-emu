@@ -359,8 +359,36 @@ impl MixerShared {
     }
 
     pub fn set_output_rate(&self, rate: u32) {
+        let previous = self.output_rate();
+
         self.atomic(OUTPUT_RATE_OFFSET)
             .store(rate, Ordering::Release);
+
+        /* THE GUEST ARRIVING IS WHAT MAKES THE ENGINE WORK, and until now only the
+         * DJ could tell it so.
+         *
+         * NativeMixer::start elects an owner and starts the engine from
+         * owner_loop -- which happens BEFORE QEMU is spawned, in every launch, and
+         * starts it with the rate still unknown (set_output_rate(0)). The real rate
+         * comes from the guest's virtio-snd once it boots. So the engine binds while
+         * the rate is zero and sits silent, and the cure is any reset afterwards --
+         * which is what the menu's Audio -> Reset audio does, by hand, every launch,
+         * because the ordering is fixed rather than racy.
+         *
+         * So do it here instead: the first time a real rate arrives, ask for the same
+         * reset the menu asks for. */
+        /* ONCE, not "whenever the rate rises from zero": owner_loop zeroes the rate
+         * before every engine start, so a plain 0 -> real test re-arms itself on each
+         * restart and resets forever. Measured -- the first version of this did exactly
+         * that, and the app log filled with engine starts until it was killed. */
+        static ANNOUNCED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        if previous == 0 && rate != 0
+            && !ANNOUNCED.swap(true, Ordering::AcqRel)
+        {
+            self.request_audio_reset();
+        }
     }
 
     pub fn device_generation(&self) -> u32 {

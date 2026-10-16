@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::audio_capture::CaptureTap;
+use crate::audio_capture::{CapturePoint, CaptureTap};
 use crate::audio_devices;
 use crate::mixer::{MixerParameter, MixerShared, CHANNEL_COUNT};
 use crate::runtime_paths;
@@ -904,7 +904,12 @@ impl Default for ChannelDsp {
 
 struct MixerRenderState {
     shared: MixerShared,
-    capture: Option<CaptureTap>,
+    /// The guest's output, before the rate conversion and the DSP.
+    capture_pre: Option<CaptureTap>,
+    /// The mixer's own output, after all of it. Both together are what makes an
+    /// artefact attributable: something wrong in the first is the deck's, and
+    /// something wrong only in the second was made here.
+    capture_post: Option<CaptureTap>,
     rate: f32,
     channels: [ChannelDsp; CHANNEL_COUNT],
     source_scratch: Vec<f32>,
@@ -917,12 +922,16 @@ struct MixerRenderState {
 
 impl MixerRenderState {
     fn new(shared: MixerShared, rate: u32) -> Self {
-        let capture = CaptureTap::open()
-            .map_err(|error| eprintln!("cdj3k-emu: pre-DSP capture unavailable: {error}"))
+        let capture_pre = CaptureTap::open(CapturePoint::PreMixer)
+            .map_err(|error| eprintln!("cdj3k-emu: pre-mixer capture unavailable: {error}"))
+            .ok();
+        let capture_post = CaptureTap::open(CapturePoint::PostMixer)
+            .map_err(|error| eprintln!("cdj3k-emu: post-mixer capture unavailable: {error}"))
             .ok();
         Self {
             shared,
-            capture,
+            capture_pre,
+            capture_post,
             rate: rate as f32,
             channels: [ChannelDsp::default(); CHANNEL_COUNT],
             source_scratch: vec![0.0; MAX_SOURCE_FRAMES * 2],
@@ -975,7 +984,7 @@ impl MixerRenderState {
                 self.shared.set_peaks(channel, [0.0, 0.0]);
                 continue;
             }
-            if let Some(capture) = &mut self.capture {
+            if let Some(capture) = &mut self.capture_pre {
                 capture.push(channel, source, source_rate);
             }
             let input = &mut self.channel_scratch[..frames * 2];
@@ -1035,6 +1044,22 @@ impl MixerRenderState {
                 let value = pair[side] * self.master_gain;
                 peaks[side] = peaks[side].max(value.abs());
                 output[frame * 2 + side] = value.clamp(-1.0, 1.0);
+            }
+        }
+        /* The master mix, for whichever deck's Debug panel is recording the
+         * post-mixer tap -- everything the mixer did to it is in these samples:
+         * the rate conversion, the interpolator, trim, EQ, filter, fader and
+         * master level, and the output clamp.
+         *
+         * It is one signal rather than one per channel, so it is offered to every
+         * channel's post slot; a push to a slot that is not armed returns at once,
+         * which makes this four checks per callback and a copy only for what is
+         * actually being recorded. That is what lets whichever player's Debug
+         * window armed it receive the mix, since the CoreAudio owner and the
+         * player asking are not necessarily the same process. */
+        if let Some(capture) = &mut self.capture_post {
+            for channel in 0..CHANNEL_COUNT {
+                capture.push(channel, &output[..frames * 2], self.rate as u32);
             }
         }
         self.master_gain = target_master;

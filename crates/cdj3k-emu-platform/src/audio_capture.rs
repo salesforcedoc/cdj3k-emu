@@ -22,14 +22,43 @@ use crate::mixer::{MixerShared, CHANNEL_COUNT};
 use crate::runtime_paths;
 
 const CAPTURE_MAGIC: u32 = u32::from_le_bytes(*b"CAP1");
-const CAPTURE_VERSION: u32 = 1;
+/// 2: a slot is now (point, channel) rather than a channel alone, so a mapping
+/// left by an older version is reinitialised rather than read as the new layout.
+const CAPTURE_VERSION: u32 = 2;
 const HEADER_BYTES: usize = 64;
 const CHANNEL_BYTES: usize = 64;
 // About 2.7 seconds of float32 stereo at 96 kHz. This absorbs filesystem
 // scheduling hiccups without adding playback latency.
 const RING_BYTES: usize = 2 * 1024 * 1024;
-const RING_BASE: usize = HEADER_BYTES + CHANNEL_COUNT * CHANNEL_BYTES;
-const CAPTURE_BYTES: usize = RING_BASE + CHANNEL_COUNT * RING_BYTES;
+
+/// Which side of the mixer a capture is taken from.
+///
+/// PRE is what the guest sent -- the deck's own output, before anything the host
+/// does to it. POST is what the mixer produced, after the rate conversion and
+/// after trim, EQ, filter, fader and master level.
+///
+/// Both taps exist because one alone cannot attribute an artefact: audio that is
+/// wrong in the guest's output was made by the deck, and audio that is wrong only
+/// in the mixer's output was made here. Reading one tap and guessing which of
+/// those it is has already cost a long afternoon on this project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapturePoint {
+    PreMixer = 0,
+    PostMixer = 1,
+}
+
+const POINTS: usize = 2;
+const SLOTS: usize = POINTS * CHANNEL_COUNT;
+
+/// One ring per (point, channel). The taps are separate regions, so both can
+/// record at once -- which is what makes them comparable sample for sample --
+/// and the mixer never has to know which of them is armed.
+const fn slot_of(point: CapturePoint, channel: usize) -> usize {
+    point as usize * CHANNEL_COUNT + channel
+}
+
+const RING_BASE: usize = HEADER_BYTES + SLOTS * CHANNEL_BYTES;
+const CAPTURE_BYTES: usize = RING_BASE + SLOTS * RING_BYTES;
 
 const MAGIC_OFFSET: usize = 0;
 const VERSION_OFFSET: usize = 4;
@@ -42,20 +71,23 @@ const DROPPED_OFFSET: usize = 24;
 /// Lightweight mapping retained by the native audio callback.
 pub struct CaptureTap {
     shared: CaptureShared,
+    point: CapturePoint,
 }
 
 impl CaptureTap {
-    pub fn open() -> io::Result<Self> {
+    pub fn open(point: CapturePoint) -> io::Result<Self> {
         Ok(Self {
             shared: CaptureShared::open()?,
+            point,
         })
     }
 
-    /// Copy a raw guest stereo block into the selected deck's capture ring.
+    /// Copy a raw stereo block into the ring for this tap's point.
     /// Never waits, allocates, locks, or performs a syscall. If the writer
     /// cannot keep up, the whole block is dropped and reported in the UI.
     pub fn push(&mut self, channel: usize, samples: &[f32], sample_rate: u32) {
-        self.shared.push(channel, samples, sample_rate);
+        self.shared
+            .push(slot_of(self.point, channel), samples, sample_rate);
     }
 }
 
@@ -69,22 +101,37 @@ pub struct AudioCaptureStatus {
     pub error: Option<String>,
 }
 
-/// UI-side controller for one deck's recording session.
+/// UI-side controller for one deck's recording session, at one tap point.
 #[derive(Clone)]
 pub struct AudioCaptureControl {
     channel: usize,
+    point: CapturePoint,
     status: Arc<Mutex<AudioCaptureStatus>>,
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     stop_requested: Arc<AtomicBool>,
 }
 
 impl AudioCaptureControl {
-    pub fn new(instance_id: u32) -> Self {
+    pub fn new(instance_id: u32, point: CapturePoint) -> Self {
         Self {
             channel: instance_id.saturating_sub(1) as usize,
+            point,
             status: Arc::new(Mutex::new(AudioCaptureStatus::default())),
             worker: Arc::new(Mutex::new(None)),
             stop_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The ring this tap records into.
+    fn slot(&self) -> usize {
+        slot_of(self.point, self.channel)
+    }
+
+    /// What this tap is called, for the dialog and the panel.
+    pub fn point_label(&self) -> &'static str {
+        match self.point {
+            CapturePoint::PreMixer => "pre-mixer",
+            CapturePoint::PostMixer => "post-mixer",
         }
     }
 
@@ -96,9 +143,13 @@ impl AudioCaptureControl {
     /// Show a save dialog and begin a WAV recording if the user chooses a
     /// destination. Returns `Ok(false)` when the dialog is cancelled.
     pub fn choose_and_start(&self) -> Result<bool, String> {
-        let suggested = format!("player-{}-capture.wav", self.channel + 1);
+        let suggested = format!(
+            "player-{}-{}-capture.wav",
+            self.channel + 1,
+            self.point_label()
+        );
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Save pre-mixer audio capture")
+            .set_title(&format!("Save {} audio capture", self.point_label()))
             .set_file_name(&suggested)
             .add_filter("WAV audio", &["wav"])
             .save_file()
@@ -138,10 +189,10 @@ impl AudioCaptureControl {
 
         let mut shared = CaptureShared::open().map_err(|e| e.to_string())?;
         // Quiesce an abandoned or previous writer before reusing its ring.
-        if shared.set_active(self.channel, false) {
+        if shared.set_active(self.slot(), false) {
             std::thread::sleep(Duration::from_millis(50));
         }
-        shared.reset(self.channel);
+        shared.reset(self.slot());
         self.stop_requested.store(false, Ordering::Release);
 
         let file = File::create(&path).map_err(|e| format!("could not create capture: {e}"))?;
@@ -156,26 +207,28 @@ impl AudioCaptureControl {
                 ..AudioCaptureStatus::default()
             };
         }
-        shared.set_active(self.channel, true);
+        shared.set_active(self.slot(), true);
 
+        let slot = self.slot();
+        let point_label = self.point_label();
         let channel = self.channel;
         let failure_status = Arc::clone(&self.status);
         let stop_requested = Arc::clone(&self.stop_requested);
         let thread = std::thread::Builder::new()
-            .name(format!("audio-capture-player-{}", channel + 1))
+            .name(format!("audio-capture-{point_label}-player-{}", channel + 1))
             .spawn(move || {
                 let result = write_capture(
                     &mut shared,
-                    channel,
+                    slot,
                     file,
                     fallback_rate,
                     &status,
                     &stop_requested,
                 );
-                shared.set_active(channel, false);
+                shared.set_active(slot, false);
                 if let Ok(mut current) = status.lock() {
                     current.active = false;
-                    current.dropped_frames = shared.dropped_frames(channel);
+                    current.dropped_frames = shared.dropped_frames(slot);
                     if let Err(error) = result {
                         current.error = Some(error.to_string());
                     }
@@ -197,7 +250,7 @@ impl AudioCaptureControl {
     pub fn stop(&self) {
         self.stop_requested.store(true, Ordering::Release);
         if let Ok(shared) = CaptureShared::open() {
-            shared.set_active(self.channel, false);
+            shared.set_active(self.slot(), false);
         }
         if let Ok(mut worker) = self.worker.lock() {
             if let Some(thread) = worker.take() {
@@ -219,7 +272,7 @@ impl AudioCaptureControl {
 
 fn write_capture(
     shared: &mut CaptureShared,
-    channel: usize,
+    slot: usize,
     file: File,
     fallback_rate: u32,
     status: &Mutex<AudioCaptureStatus>,
@@ -231,14 +284,14 @@ fn write_capture(
 
     loop {
         if stop_requested.load(Ordering::Acquire) {
-            shared.set_active(channel, false);
+            shared.set_active(slot, false);
         }
-        let active = shared.active(channel);
-        let available = shared.available_frames(channel);
+        let active = shared.active(slot);
+        let available = shared.available_frames(slot);
         if !active && available == 0 {
             break;
         }
-        let rate = shared.sample_rate(channel);
+        let rate = shared.sample_rate(slot);
         if wav.is_none() && rate != 0 {
             wav = Some(WavWriter::begin(file.take().unwrap(), rate)?);
         }
@@ -251,7 +304,7 @@ fn write_capture(
             }
         }
 
-        let frames = shared.read(channel, &mut scratch);
+        let frames = shared.read(slot, &mut scratch);
         if frames == 0 {
             std::thread::sleep(Duration::from_millis(4));
             continue;
@@ -263,7 +316,7 @@ fn write_capture(
         if let Ok(mut current) = status.lock() {
             current.sample_rate = writer.sample_rate;
             current.frames_written = writer.frames_written;
-            current.dropped_frames = shared.dropped_frames(channel);
+            current.dropped_frames = shared.dropped_frames(slot);
         }
     }
 
@@ -371,29 +424,29 @@ impl CaptureShared {
         Ok(Self { mmap })
     }
 
-    fn active(&self, channel: usize) -> bool {
-        channel < CHANNEL_COUNT
+    fn active(&self, slot: usize) -> bool {
+        slot < SLOTS
             && self
-                .atomic_u32(channel_offset(channel) + ACTIVE_OFFSET)
+                .atomic_u32(slot_header_offset(slot) + ACTIVE_OFFSET)
                 .load(Ordering::Acquire)
                 != 0
     }
 
     /// Returns the previous active state.
-    fn set_active(&self, channel: usize, active: bool) -> bool {
-        if channel >= CHANNEL_COUNT {
+    fn set_active(&self, slot: usize, active: bool) -> bool {
+        if slot >= SLOTS {
             return false;
         }
-        self.atomic_u32(channel_offset(channel) + ACTIVE_OFFSET)
+        self.atomic_u32(slot_header_offset(slot) + ACTIVE_OFFSET)
             .swap(u32::from(active), Ordering::AcqRel)
             != 0
     }
 
-    fn reset(&mut self, channel: usize) {
-        if channel >= CHANNEL_COUNT {
+    fn reset(&mut self, slot: usize) {
+        if slot >= SLOTS {
             return;
         }
-        let base = channel_offset(channel);
+        let base = slot_header_offset(slot);
         self.atomic_u32(base + SAMPLE_RATE_OFFSET)
             .store(0, Ordering::Release);
         self.atomic_u64(base + HEAD_OFFSET)
@@ -404,44 +457,44 @@ impl CaptureShared {
             .store(0, Ordering::Release);
     }
 
-    fn sample_rate(&self, channel: usize) -> u32 {
-        if channel >= CHANNEL_COUNT {
+    fn sample_rate(&self, slot: usize) -> u32 {
+        if slot >= SLOTS {
             return 0;
         }
-        self.atomic_u32(channel_offset(channel) + SAMPLE_RATE_OFFSET)
+        self.atomic_u32(slot_header_offset(slot) + SAMPLE_RATE_OFFSET)
             .load(Ordering::Acquire)
     }
 
-    fn available_frames(&self, channel: usize) -> usize {
-        if channel >= CHANNEL_COUNT {
+    fn available_frames(&self, slot: usize) -> usize {
+        if slot >= SLOTS {
             return 0;
         }
-        let base = channel_offset(channel);
+        let base = slot_header_offset(slot);
         let head = self.atomic_u64(base + HEAD_OFFSET).load(Ordering::Acquire);
         let tail = self.atomic_u64(base + TAIL_OFFSET).load(Ordering::Relaxed);
         head.saturating_sub(tail) as usize / 8
     }
 
-    fn dropped_frames(&self, channel: usize) -> u64 {
-        if channel >= CHANNEL_COUNT {
+    fn dropped_frames(&self, slot: usize) -> u64 {
+        if slot >= SLOTS {
             return 0;
         }
-        self.atomic_u64(channel_offset(channel) + DROPPED_OFFSET)
+        self.atomic_u64(slot_header_offset(slot) + DROPPED_OFFSET)
             .load(Ordering::Acquire)
     }
 
-    fn push(&mut self, channel: usize, samples: &[f32], sample_rate: u32) {
-        if channel >= CHANNEL_COUNT || samples.len() < 2 || !self.active(channel) {
+    fn push(&mut self, slot: usize, samples: &[f32], sample_rate: u32) {
+        if slot >= SLOTS || samples.len() < 2 || !self.active(slot) {
             return;
         }
         let frames = samples.len() / 2;
         let bytes_requested = frames * 8;
         if bytes_requested > RING_BYTES {
-            self.atomic_u64(channel_offset(channel) + DROPPED_OFFSET)
+            self.atomic_u64(slot_header_offset(slot) + DROPPED_OFFSET)
                 .fetch_add(frames as u64, Ordering::Relaxed);
             return;
         }
-        let base = channel_offset(channel);
+        let base = slot_header_offset(slot);
         let head = self.atomic_u64(base + HEAD_OFFSET).load(Ordering::Relaxed);
         let tail = self.atomic_u64(base + TAIL_OFFSET).load(Ordering::Acquire);
         if head.saturating_sub(tail) as usize + bytes_requested > RING_BYTES {
@@ -449,7 +502,7 @@ impl CaptureShared {
                 .fetch_add(frames as u64, Ordering::Relaxed);
             return;
         }
-        let ring = ring_offset(channel);
+        let ring = slot_ring_offset(slot);
         let offset = (head as usize) & (RING_BYTES - 1);
         let first = bytes_requested.min(RING_BYTES - offset);
         // SAFETY: the mapping is writable, both ring regions are in bounds,
@@ -474,20 +527,20 @@ impl CaptureShared {
             .store(head + bytes_requested as u64, Ordering::Release);
     }
 
-    fn read(&mut self, channel: usize, output: &mut [f32]) -> usize {
-        if channel >= CHANNEL_COUNT || output.len() < 2 {
+    fn read(&mut self, slot: usize, output: &mut [f32]) -> usize {
+        if slot >= SLOTS || output.len() < 2 {
             return 0;
         }
-        let available = self.available_frames(channel);
+        let available = self.available_frames(slot);
         let frames = available.min(output.len() / 2);
         if frames == 0 {
             return 0;
         }
         let bytes_requested = frames * 8;
-        let base = channel_offset(channel);
+        let base = slot_header_offset(slot);
         let tail_atomic = self.atomic_u64(base + TAIL_OFFSET);
         let tail = tail_atomic.load(Ordering::Relaxed);
-        let ring = ring_offset(channel);
+        let ring = slot_ring_offset(slot);
         let offset = (tail as usize) & (RING_BYTES - 1);
         let first = bytes_requested.min(RING_BYTES - offset);
         // SAFETY: the producer publishes head only after writing, and these
@@ -521,12 +574,12 @@ impl CaptureShared {
     }
 }
 
-const fn channel_offset(channel: usize) -> usize {
-    HEADER_BYTES + channel * CHANNEL_BYTES
+const fn slot_header_offset(slot: usize) -> usize {
+    HEADER_BYTES + slot * CHANNEL_BYTES
 }
 
-const fn ring_offset(channel: usize) -> usize {
-    RING_BASE + channel * RING_BYTES
+const fn slot_ring_offset(slot: usize) -> usize {
+    RING_BASE + slot * RING_BYTES
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {

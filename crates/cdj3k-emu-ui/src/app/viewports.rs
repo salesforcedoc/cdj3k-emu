@@ -98,7 +98,8 @@ impl CdjApp {
         let snapshot = Arc::clone(&self.debug_snapshot);
         let vp_state = Arc::clone(&self.debug_viewport_state);
         let wants_close = Arc::clone(&self.debug_wants_close);
-        let audio_capture = self.audio_capture.clone();
+        let capture_pre = self.capture_pre.clone();
+        let capture_post = self.capture_post.clone();
         // Live MOSI peek bypasses the snapshot path so debug shows real-time
         // wire bytes even when the main viewport's repaint filter is quiet.
         let live_mosi = self.ctrl_stream.latest_mosi_arc();
@@ -128,7 +129,13 @@ impl CdjApp {
                     )
                     .show(inner_ctx, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            ui::draw_debug_content(ui, &snap, local_fps, &audio_capture);
+                            ui::draw_debug_content(
+                                ui,
+                                &snap,
+                                local_fps,
+                                &capture_pre,
+                                &capture_post,
+                            );
                         });
                     });
 

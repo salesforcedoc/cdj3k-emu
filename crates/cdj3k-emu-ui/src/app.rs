@@ -159,7 +159,11 @@ pub struct CdjApp {
     mixer_midi_assignments: cdj3k_emu_storage::MidiMixerAssignments,
     midi_learn: midi::MidiLearnState,
     audio_latency: audio_latency::AudioLatencyPanel,
-    audio_capture: cdj3k_emu_platform::audio_capture::AudioCaptureControl,
+    /// Two taps, one per side of the mixer. Both exist so an artefact can be
+    /// attributed rather than guessed at: the pre tap is the deck's own output,
+    /// the post tap is what the mixer made of it.
+    capture_pre: cdj3k_emu_platform::audio_capture::AudioCaptureControl,
+    capture_post: cdj3k_emu_platform::audio_capture::AudioCaptureControl,
     mixer: mixer::MixerPanel,
 
     nav_angle: f32,
@@ -298,8 +302,9 @@ impl CdjApp {
         let repaint_gate = RepaintGate::new(egui_ctx.clone(), MIN_FRAME_INTERVAL);
         let midi_controls = midi::MidiControls::new(repaint_gate.clone());
         let audio_latency = audio_latency::AudioLatencyPanel::new(menu_state::lock().audio_latency);
-        let audio_capture =
-            cdj3k_emu_platform::audio_capture::AudioCaptureControl::new(instance_id);
+        use cdj3k_emu_platform::audio_capture::{AudioCaptureControl, CapturePoint};
+        let capture_pre = AudioCaptureControl::new(instance_id, CapturePoint::PreMixer);
+        let capture_post = AudioCaptureControl::new(instance_id, CapturePoint::PostMixer);
         let mixer = mixer::MixerPanel::new(instance_id);
         Self {
             jog_pos: 0,
@@ -341,7 +346,8 @@ impl CdjApp {
             mixer_midi_assignments,
             midi_learn: midi::MidiLearnState::new(),
             audio_latency,
-            audio_capture,
+            capture_pre,
+            capture_post,
             mixer,
             nav_angle: 0.0,
             nav_scroll_accum: 0.0,
@@ -636,7 +642,8 @@ impl eframe::App for CdjApp {
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
-        self.audio_capture.stop();
+        self.capture_pre.stop();
+        self.capture_post.stop();
         self.mixer.flush();
         // Inject the power-off MISO frame directly: on app exit the egui loop
         // is already stopped, so `poll_menu_state` will never consume

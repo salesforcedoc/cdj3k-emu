@@ -208,28 +208,14 @@ impl Default for DebugSnapshot {
     }
 }
 
-/// Render the debug pane from a snapshot. `local_fps` is the fps measured
-/// inside the debug viewport's own update cycle (independent of `main_fps`).
-pub(super) fn draw_debug_content(
+/// One capture tap's button and readout. Drawn once per tap point; `blurb` says
+/// which side of the mixer that tap records.
+fn draw_capture_block(
     ui: &mut egui::Ui,
-    snap: &DebugSnapshot,
-    local_fps: f32,
+    mono: &egui::FontId,
     capture: &cdj3k_emu_platform::audio_capture::AudioCaptureControl,
+    blurb: &str,
 ) {
-    let mono = egui::FontId::monospace(11.0);
-
-    // ---- Status / FPS / shape count ----
-    ui.label(egui::RichText::new(&snap.status).font(mono.clone()));
-    ui.label(
-        egui::RichText::new(format!(
-            "fps: {:.1} (debug)  {:.1} (main)  shapes/f: {}",
-            local_fps, snap.main_fps, snap.main_shape_count
-        ))
-        .font(mono.clone()),
-    );
-    ui.separator();
-
-    // ---- Pre-DSP audio capture ----
     let capture_status = capture.status();
     ui.horizontal(|ui| {
         if capture_status.active {
@@ -242,7 +228,7 @@ pub(super) fn draw_debug_content(
             }
         }
         ui.label(
-            egui::RichText::new("deck input · pre trim / EQ / filter / fader")
+            egui::RichText::new(blurb)
                 .font(mono.clone())
                 .color(egui::Color32::GRAY),
         );
@@ -271,6 +257,46 @@ pub(super) fn draw_debug_content(
     if let Some(error) = &capture_status.error {
         ui.colored_label(egui::Color32::LIGHT_RED, format!("capture error: {error}"));
     }
+}
+
+/// Render the debug pane from a snapshot. `local_fps` is the fps measured
+/// inside the debug viewport's own update cycle (independent of `main_fps`).
+pub(super) fn draw_debug_content(
+    ui: &mut egui::Ui,
+    snap: &DebugSnapshot,
+    local_fps: f32,
+    capture_pre: &cdj3k_emu_platform::audio_capture::AudioCaptureControl,
+    capture_post: &cdj3k_emu_platform::audio_capture::AudioCaptureControl,
+) {
+    let mono = egui::FontId::monospace(11.0);
+
+    // ---- Status / FPS / shape count ----
+    ui.label(egui::RichText::new(&snap.status).font(mono.clone()));
+    ui.label(
+        egui::RichText::new(format!(
+            "fps: {:.1} (debug)  {:.1} (main)  shapes/f: {}",
+            local_fps, snap.main_fps, snap.main_shape_count
+        ))
+        .font(mono.clone()),
+    );
+    ui.separator();
+
+    // ---- Audio capture, both taps ----
+    // Two taps, and deliberately side by side: an artefact can be attributed to
+    // the deck or to the mixer only by comparing them on the same passage, and
+    // one tap alone leaves it a guess.
+    draw_capture_block(
+        ui,
+        &mono,
+        capture_pre,
+        "deck input · pre resample, trim / EQ / filter / fader",
+    );
+    draw_capture_block(
+        ui,
+        &mono,
+        capture_post,
+        "mixer output · post resample, EQ, fader and master",
+    );
     ui.separator();
 
     // ---- USB Save ----

@@ -84,6 +84,9 @@ int g_seq_wr = -1;
 int g_drm_active[MAX_ACTIVE_FDS];
 int g_seq_active[MAX_ALSA_FDS];
 
+/* -1 until the panel is opened; see fd.c's subucom helpers. */
+int g_subucom_fd = -1;
+
 /* Shared by clock.c and link.c. Raw-syscall sysfs reader so we don't
  * pull stdio into the audio hot path. Parses the LAST integer in the
  * line (handles both `42\n` and CSV `g,h,t\n`). */

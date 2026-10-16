@@ -386,6 +386,11 @@ extern int            g_seq_wr;
 extern int            g_drm_active[MAX_ACTIVE_FDS];
 extern int            g_seq_active[MAX_ALSA_FDS];
 
+/* The control panel's frame fd - one device, so one slot and not a table. It is
+ * registered at open() so read() can recognise a panel frame and offer it to the
+ * mods, which is the only way a synthetic key press can be written into the deck. */
+extern int            g_subucom_fd;
+
 /* ------------------------------------------------------------------ */
 /* Shared sysfs paths and helper (clock.c + link.c)                   */
 /* ------------------------------------------------------------------ */
@@ -418,6 +423,10 @@ void remove_drm_fd(int fd);
 int  is_seq_fd(int fd);
 int  add_seq_fd(int fd);
 void remove_seq_fd(int fd);
+
+int  is_subucom_fd(int fd);
+void add_subucom_fd(int fd);
+void remove_subucom_fd(int fd);
 
 int  is_hidg_fd(int fd);
 int  add_hidg_fd(int fd);

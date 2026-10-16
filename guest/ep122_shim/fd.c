@@ -73,6 +73,23 @@ void remove_seq_fd(int fd) {
     }
 }
 
+/* ---- subucom panel fd helpers ----
+ *
+ * The control panel's frames arrive on /dev/subucom_spi1.0 and EP122 reads them
+ * in a tight loop. One device, so one slot: registering the fd is what lets
+ * read() recognise the frame it is about to hand back, since a 64-byte read
+ * looks like any other otherwise.
+ */
+int is_subucom_fd(int fd) {
+    return fd >= 0 && LOAD(&g_subucom_fd) == fd;
+}
+void add_subucom_fd(int fd) {
+    STORE(&g_subucom_fd, fd);
+}
+void remove_subucom_fd(int fd) {
+    if (LOAD(&g_subucom_fd) == fd) STORE(&g_subucom_fd, -1);
+}
+
 /* ---- HIDG fd helpers ---- */
 int is_hidg_fd(int fd) {
     if (fd < 0) return 0;

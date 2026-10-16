@@ -112,7 +112,19 @@ ssize_t read(int fd, void *buf, size_t count) {
         return r;
     }
 
-    /* --- All other fds (including subucom_virt.ko): passthrough --- */
+    /* --- panel fd: the control panel's frames. The real read happens first;
+     * what it returned is offered to the mods, which may set a switch bit or
+     * move the rotary counter inside it before EP122 ever sees it. That is the
+     * whole of "simulate a key press": the deck cannot tell a synthesised frame
+     * from a real one, and nothing else has to know. */
+    if (is_subucom_fd(fd)) {
+        ssize_t r = sys_read(fd, buf, count);
+        if (r > 0)
+            panel_frame(buf, (size_t)r);
+        return r;
+    }
+
+    /* --- All other fds: passthrough --- */
     return sys_read(fd, buf, count);
 }
 

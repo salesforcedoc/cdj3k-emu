@@ -48,6 +48,19 @@ static int do_open(const char *pathname, int flags, mode_t mode) {
             DBG("open(%s) → real DRM fd %ld\n", pathname, fd);
             return (int)fd;
         }
+
+        /* /dev/subucom_spi1.0 - the control panel, provided by subucom_virt.ko.
+         * Registered here so read() can recognise the frames EP122 takes from it
+         * and offer each one to the mods: that is where a synthetic key press is
+         * written, and it has to be at the frame, because the deck has no other
+         * door into its own panel input. */
+        if (strncmp(pathname, "/dev/subucom_spi", 16) == 0) {
+            long fd = syscall(SYS_openat, AT_FDCWD, pathname, flags, (long)mode);
+            if (fd < 0) { return -1; } /* errno already set by glibc syscall() */
+            add_subucom_fd((int)fd);
+            DBG("open(%s) → panel fd %ld\n", pathname, fd);
+            return (int)fd;
+        }
         /* ALSA control/PCM: pass through to virtio_snd.ko (card 0, real kernel device). */
         /* ALSA sequencer: /dev/snd/seq
          * EP122 opens this O_RDWR|O_NONBLOCK to send MIDI to the USB host

@@ -152,6 +152,18 @@ ssize_t write(int fd, const void *buf, size_t count) {
         (void)buf;
         return (ssize_t)count;
     }
+    /* Panel fd: the deck's LED frame, and it sends the WHOLE frame on every update
+     * -- the host renders its lamp panel from exactly these bytes. So the latest
+     * frame's screen lamps ARE the screen in front, which is why the mods' screen gate
+     * prefers them to any timestamp: state, not recency. Bytes 4 and 5 carry the six
+     * navigation lamps (see mosi_frame.rs for the table and their two-bit encoding). */
+    if (is_subucom_fd(fd) && count >= 8) {
+        const unsigned char *p = (const unsigned char *)buf;
+
+        g_panel_lamps = (p[4] & 0x55) | ((p[5] & 0x05) << 8);
+        return sys_write(fd, buf, count);
+    }
+
     /* The caller, not just the fact. A return address is what turns "the
      * library file changed" into "this code changed it". */
     db_watch_write(fd, count, (uintptr_t)__builtin_return_address(0));

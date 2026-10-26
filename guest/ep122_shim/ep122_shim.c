@@ -87,6 +87,10 @@ int g_seq_active[MAX_ALSA_FDS];
 /* -1 until the panel is opened; see fd.c's subucom helpers. */
 int g_subucom_fd = -1;
 
+/* The screen lamps from the deck's latest LED frame: bit 0 source, 1 browse,
+ * 2 tag list, 3 playlist, 8 search, 9 menu. Written by write() for the panel fd. */
+int g_panel_lamps;
+
 /* Shared by clock.c and link.c. Raw-syscall sysfs reader so we don't
  * pull stdio into the audio hot path. Parses the LAST integer in the
  * line (handles both `42\n` and CSV `g,h,t\n`). */

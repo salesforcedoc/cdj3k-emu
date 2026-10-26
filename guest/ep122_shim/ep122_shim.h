@@ -391,6 +391,10 @@ extern int            g_seq_active[MAX_ALSA_FDS];
  * mods, which is the only way a synthetic key press can be written into the deck. */
 extern int            g_subucom_fd;
 
+/* The deck's screen lamps from its latest LED frame; see write() in syscalls_io.c
+ * and g_panel_lamps' definition in ep122_shim.c. */
+extern int            g_panel_lamps;
+
 /* ------------------------------------------------------------------ */
 /* Shared sysfs paths and helper (clock.c + link.c)                   */
 /* ------------------------------------------------------------------ */
